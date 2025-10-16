@@ -19,7 +19,11 @@ from arclib.arc import (
 )
 import arclib.augmenters  # noqa: F401 to prevent removal by black
 from arclib.eval import evaluate
-from arclib.messagers import GPTTextMessageRepresenterV2, GPTTextMessageRepresenterForBarc
+from arclib.messagers import (
+    GPTTextMessageRepresenterForBarc,
+    GPTTextMessageRepresenterV2,
+    PythonSolverMessageRepresenter,
+)
 from arclib.representers import (
     DiffExampleRepresenter,
     PythonListGridRepresenter,
@@ -30,6 +34,7 @@ from arclib.representers import (
 from arclib.voting import vote
 from inference.engine import get_sampling_params, initialize_engine, process_requests
 from inference.preprocess import get_preprocessed_tasks
+from utils.python_executor import extract_solver_code, run_solver
 
 
 parser = argparse.ArgumentParser(description="Process some integers.")
@@ -119,11 +124,20 @@ parser.add_argument(
     "--n_self_edits", type=int, required=True, help="Number of self edits to evaluate"
 )
 
+parser.add_argument(
+    "--code_mode",
+    action="store_true",
+    help="Format prompts for Python solver generation instead of grid outputs",
+)
+
 args = parser.parse_args()
 
 # set seed
 np.random.seed(args.seed)
 torch.manual_seed(args.seed)
+
+if args.code_mode and (args.new_format or args.barc_format or args.add_diff_format):
+    raise ValueError("--code_mode cannot be combined with grid formatting flags.")
 
 # print args
 print("Arguments:")
@@ -150,7 +164,9 @@ if args.num_examples is not None:
     tasks = tasks[: args.num_examples]
 
 formatters = []
-if args.new_format:
+if args.code_mode:
+    formatters.append(PythonSolverMessageRepresenter())
+elif args.new_format:
     messager = GPTTextMessageRepresenterV2(
         task_representer=TextTaskRepresenter(
             example_representer=TextExampleRepresenter(
@@ -301,7 +317,69 @@ for lora_edit_idx in range(args.n_self_edits):
         input = inputs_to_remember[key]["input"]["content"]
         current_formatter = eval(current_formatter_repr)
 
+        task_obj = inputs_to_remember[key]["task"]
+
         for output in outputs:
+            if args.code_mode:
+                code = extract_solver_code(output)
+                exec_result = run_solver(
+                    code,
+                    train_examples=task_obj.train_examples,
+                    test_input=task_obj.test_example.input,
+                )
+
+                if exec_result.success and exec_result.output is not None:
+                    try:
+                        normalized = to_tuple(inverter_fn(exec_result.output))
+                    except Exception as error:
+                        print(f"Failed to apply inverter for {key}: {error}")
+                        outputs_by_key[key].append(
+                            {
+                                "status": "error",
+                                "error_type": "InverterFailure",
+                                "message": str(error),
+                                "code": code,
+                                "stdout": exec_result.stdout,
+                                "stderr": exec_result.stderr,
+                                "formatter": current_formatter_repr,
+                                "inverter": inverter,
+                                "raw_response": output,
+                            }
+                        )
+                        continue
+
+                    outputs_by_key[key].append(
+                        {
+                            "status": "ok",
+                            "output": normalized,
+                            "code": code,
+                            "stdout": exec_result.stdout,
+                            "stderr": exec_result.stderr,
+                            "inverter": inverter,
+                            "formatter": current_formatter_repr,
+                            "raw_response": output,
+                        }
+                    )
+                else:
+                    print(
+                        f"Solver execution failed for {key}: "
+                        f"{exec_result.error_type}: {exec_result.message}"
+                    )
+                    outputs_by_key[key].append(
+                        {
+                            "status": "error",
+                            "error_type": exec_result.error_type or "ExecutionError",
+                            "message": exec_result.message,
+                            "code": code,
+                            "stdout": exec_result.stdout,
+                            "stderr": exec_result.stderr,
+                            "inverter": inverter,
+                            "formatter": current_formatter_repr,
+                            "raw_response": output,
+                        }
+                    )
+                continue
+
             output = output.replace("#", "")
             output = output.replace("  ", " ")
             if "```" in output:
@@ -343,14 +421,22 @@ for lora_edit_idx in range(args.n_self_edits):
     all_predictions_file = os.path.join(args.experiment_folder, "all_predictions.json")
 
     with open(all_predictions_file, "w") as f:
-        json.dump(outputs_by_key, f)
+        json.dump(outputs_by_key, f, indent=2)
+
+    if args.code_mode:
+        print("Code mode enabled; solver outputs saved to all_predictions.json.")
 
     outputs = {}
     for task in tasks:
         name = task.name
 
-        to_vote = [out for key, out in outputs_by_key.items() if name in key]
-        to_vote = [out for sublist in to_vote for out in sublist]
+        to_vote = [
+            entry
+            for key, entries in outputs_by_key.items()
+            if name in key
+            for entry in entries
+            if "output" in entry
+        ]
 
         if len(to_vote) == 0:
             outputs[name] = [[[0]], [[0]]]
@@ -367,14 +453,31 @@ for lora_edit_idx in range(args.n_self_edits):
     print(f"Submission file is saved to {submission_file}")
 
     # evaluate
+    result_payload = {}
     if args.solution_file is not None:
         task_info = evaluate(args.data_file, args.solution_file, submission_file)
-        final_results[lora_edit_idx] = task_info
+        result_payload = task_info
+
+    if args.code_mode:
+        if hasattr(result_payload, "to_dict"):
+            metrics = result_payload.to_dict()
+        elif isinstance(result_payload, dict):
+            metrics = result_payload
+        else:
+            metrics = {"result": result_payload}
+        result_payload = {
+            "metrics": metrics,
+            "code_mode": True,
+            "outputs_path": all_predictions_file,
+        }
+
+    final_results[lora_edit_idx] = result_payload
 
 print(final_results)
 # save final results
-for k in final_results.keys():
-    final_results[k] = final_results[k].to_dict()
+for k, value in list(final_results.items()):
+    if hasattr(value, "to_dict"):
+        final_results[k] = value.to_dict()
 
 with open(os.path.join("final_results.json"), "w") as f:
     json.dump(final_results, f)
