@@ -125,6 +125,50 @@ parser.add_argument(
     action="store_true",
     help="Format prompts for Python solver generation instead of grid outputs",
 )
+parser.add_argument(
+    "--vllm_dtype",
+    type=str,
+    default="float16",
+    choices=["auto", "float16", "bfloat16"],
+    help="Precision to use for vLLM weights (default: float16).",
+)
+parser.add_argument(
+    "--vllm_max_model_len",
+    type=int,
+    default=4096,
+    help="Upper bound on sequence length handed to vLLM (default: 4096).",
+)
+parser.add_argument(
+    "--vllm_max_num_batched_tokens",
+    type=int,
+    default=4096,
+    help="Cap the total tokens per batch to control KV cache size.",
+)
+parser.add_argument(
+    "--vllm_gpu_memory_utilization",
+    type=float,
+    default=0.6,
+    help="Fraction of GPU memory vLLM may reserve (default: 0.6).",
+)
+parser.add_argument(
+    "--vllm_tensor_parallel_size",
+    type=int,
+    default=1,
+    help="Tensor parallel world size for vLLM (default: 1).",
+)
+parser.add_argument(
+    "--vllm_enforce_eager",
+    dest="vllm_enforce_eager",
+    action="store_true",
+    help="Force eager execution to avoid torch.compile capture (default).",
+)
+parser.add_argument(
+    "--no_vllm_enforce_eager",
+    dest="vllm_enforce_eager",
+    action="store_false",
+    help="Disable eager enforcement when you have spare memory.",
+)
+parser.set_defaults(vllm_enforce_eager=True)
 
 args = parser.parse_args()
 
@@ -252,8 +296,13 @@ engine = initialize_engine(
     quantization=args.quantization,
     max_lora_rank=lora_adapter_config.get("r", args.max_lora_rank),
     enable_lora=args.lora_checkpoints_folder is not None,
-    enforce_eager=False,
+    enforce_eager=args.vllm_enforce_eager,
     lora_target_modules=lora_adapter_config.get("target_modules", None),
+    dtype=args.vllm_dtype,
+    max_model_len=args.vllm_max_model_len,
+    max_num_batched_tokens=args.vllm_max_num_batched_tokens,
+    gpu_memory_utilization=args.vllm_gpu_memory_utilization,
+    tensor_parallel_size=args.vllm_tensor_parallel_size,
 )
 
 

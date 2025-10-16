@@ -17,6 +17,25 @@ pip install -r requirements.txt  # run from the repository root
 
 The dependency pins intentionally keep ``numpy`` on the 1.26 series so that the ``scikit-learn`` wheels pulled in by ``transformers`` remain binary compatible.  Installing the requirements inside a clean environment avoids the ``ValueError: numpy.dtype size changed`` crash that can arise when an older ``scikit-learn`` build from a base Conda installation is left alongside ``numpy`` 2.x.
 
+### Memory-safe defaults for local vLLM runs
+
+Scripts that launch a local vLLM engine (`self-edit.py`, `predict_baseline.py`, `predict_custom.py`, and the evaluation utilities) now accept a small set of flags that cap sequence length and KV-cache growth while forcing eager execution.  The defaults keep weights in FP16, limit batches to ~4k tokens, and reserve at most 60% of the GPU memory so 1–3B parameter checkpoints fit comfortably on 24 GB cards.  Override them as needed, e.g.:
+
+```bash
+python self-edit.py \
+    --experiment_name=training_set_iteration_1 \
+    --challenge_file=${DATA_DIR}/arc-agi_training_challenges_filtered_1B_training_set.json \
+    --solution_file=${DATA_DIR}/arc-agi_training_solutions_filtered_1B_training_set.json \
+    --model_name=TinyLlama/TinyLlama-1.1B-Chat-v1.0 \
+    --n_tasks=12 \
+    --n_self_edits_per_task=15 \
+    --vllm_max_model_len=3072 \
+    --vllm_gpu_memory_utilization=0.55 \
+    --vllm_max_num_batched_tokens=3072
+```
+
+Passing `--no_vllm_enforce_eager` re-enables `torch.compile` graph capture if you have additional headroom and want the extra throughput.
+
 ### 1. Training on 12 Problems (Iteration 1)
 
 Train the base model on 12 problems from ARC train set:

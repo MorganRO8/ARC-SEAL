@@ -30,6 +30,13 @@ class LocalLMClient:
                     "vllm is required for the 'vllm' backend"
                 ) from exc
 
+            backend_kwargs.setdefault("dtype", "float16")
+            backend_kwargs.setdefault("max_model_len", 4096)
+            backend_kwargs.setdefault("max_num_batched_tokens", 4096)
+            backend_kwargs.setdefault("gpu_memory_utilization", 0.6)
+            if backend_kwargs.get("enforce_eager") is None:
+                backend_kwargs["enforce_eager"] = True
+
             self._sampling_params = sampling_params or SamplingParams()
             self._model = LLM(model=model_path, **backend_kwargs)
             self._generate = self._generate_vllm

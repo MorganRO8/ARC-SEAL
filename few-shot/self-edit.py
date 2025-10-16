@@ -500,6 +500,12 @@ def main(
     n_tasks,
     n_self_edits_per_task,
     code_mode: bool = False,
+    vllm_dtype: str = "float16",
+    vllm_max_model_len: int = 4096,
+    vllm_max_num_batched_tokens: int = 4096,
+    vllm_gpu_memory_utilization: float = 0.6,
+    vllm_enforce_eager: bool = True,
+    vllm_tensor_parallel_size: int = 1,
 ):
     # lora config
     lora_config = LoraConfig(
@@ -544,7 +550,21 @@ def main(
 
     # Phase 1: Generate configs using self-edit model
     print("Phase 1: Generating configs using self-edit model...")
-    self_edit_model = LLM(model=model_name)
+    llm_kwargs = {}
+    if vllm_dtype:
+        llm_kwargs["dtype"] = vllm_dtype
+    if vllm_max_model_len and vllm_max_model_len > 0:
+        llm_kwargs["max_model_len"] = vllm_max_model_len
+    if vllm_max_num_batched_tokens and vllm_max_num_batched_tokens > 0:
+        llm_kwargs["max_num_batched_tokens"] = vllm_max_num_batched_tokens
+    if vllm_gpu_memory_utilization and vllm_gpu_memory_utilization > 0:
+        llm_kwargs["gpu_memory_utilization"] = vllm_gpu_memory_utilization
+    if vllm_tensor_parallel_size and vllm_tensor_parallel_size > 0:
+        llm_kwargs["tensor_parallel_size"] = vllm_tensor_parallel_size
+    llm_kwargs["enforce_eager"] = vllm_enforce_eager
+
+    print(f"Initializing vLLM with kwargs: {llm_kwargs}")
+    self_edit_model = LLM(model=model_name, **llm_kwargs)
     sampling_params = SamplingParams(
         max_tokens=128,
         temperature=0.8,
@@ -887,6 +907,21 @@ if __name__ == "__main__":
                       help='Number of self-edits per task')
     parser.add_argument('--code_mode', action='store_true',
                       help='Format prompts for Python solver generation instead of grid outputs')
+    parser.add_argument('--vllm_dtype', type=str, default='float16', choices=['auto', 'float16', 'bfloat16'],
+                      help='Precision to use for vLLM weights (default: float16 for lower memory use).')
+    parser.add_argument('--vllm_max_model_len', type=int, default=4096,
+                      help='Upper bound on sequence length handed to vLLM (default: 4096 tokens).')
+    parser.add_argument('--vllm_max_num_batched_tokens', type=int, default=4096,
+                      help='Cap on the total tokens processed per batch to limit KV cache size.')
+    parser.add_argument('--vllm_gpu_memory_utilization', type=float, default=0.6,
+                      help='Fraction of GPU memory vLLM may reserve (default: 0.6).')
+    parser.add_argument('--vllm_tensor_parallel_size', type=int, default=1,
+                      help='Tensor parallel world size for vLLM (default: 1).')
+    parser.add_argument('--vllm_enforce_eager', dest='vllm_enforce_eager', action='store_true',
+                      help='Force eager execution to avoid torch.compile capture (default).')
+    parser.add_argument('--no_vllm_enforce_eager', dest='vllm_enforce_eager', action='store_false',
+                      help='Disable eager enforcement if you prefer torch.compile graphs.')
+    parser.set_defaults(vllm_enforce_eager=True)
 
     args = parser.parse_args()
 
@@ -899,6 +934,12 @@ if __name__ == "__main__":
         n_tasks=args.n_tasks,
         n_self_edits_per_task=args.n_self_edits_per_task,
         code_mode=args.code_mode,
+        vllm_dtype=args.vllm_dtype,
+        vllm_max_model_len=args.vllm_max_model_len,
+        vllm_max_num_batched_tokens=args.vllm_max_num_batched_tokens,
+        vllm_gpu_memory_utilization=args.vllm_gpu_memory_utilization,
+        vllm_enforce_eager=args.vllm_enforce_eager,
+        vllm_tensor_parallel_size=args.vllm_tensor_parallel_size,
     )
     
    
