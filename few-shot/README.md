@@ -5,6 +5,18 @@ Code is adopted from: [Ekin's Repo](https://github.com/ekinakyurek/marc/tree/mai
 
 ## SEAL RL Iteration 1
 
+### Environment setup
+
+Create a fresh virtual environment (``python -m venv .venv``) and install the pinned dependencies from the repository root before running any of the commands below:
+
+```bash
+source .venv/bin/activate
+pip install --upgrade pip
+pip install -r requirements.txt  # run from the repository root
+```
+
+The dependency pins intentionally keep ``numpy`` on the 1.26 series so that the ``scikit-learn`` wheels pulled in by ``transformers`` remain binary compatible.  Installing the requirements inside a clean environment avoids the ``ValueError: numpy.dtype size changed`` crash that can arise when an older ``scikit-learn`` build from a base Conda installation is left alongside ``numpy`` 2.x.
+
 ### 1. Training on 12 Problems (Iteration 1)
 
 Train the base model on 12 problems from ARC train set:
