@@ -574,7 +574,13 @@ def main(
     explored_configs = {}
     task_configs = {}  # Store full configs for each task
 
-    for i in range(n_tasks):
+    total_tasks = min(n_tasks, len(tasks))
+    if n_tasks > len(tasks):
+        print(
+            f"Requested {n_tasks} tasks but only {len(tasks)} available; limiting to {total_tasks}."
+        )
+
+    for i in tqdm(range(total_tasks), desc="Self-edit tasks", unit="task"):
         task = tasks[i]
 
         # Get the base task name (without -0 or -1 suffix) skip if it has -1 suffix
