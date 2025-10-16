@@ -742,9 +742,28 @@ def main(
                 except json.JSONDecodeError:
                     continue
 
+                if not isinstance(config, dict):
+                    print(
+                        "Skipping generated config: expected a JSON object but received "
+                        f"{type(config).__name__}."
+                    )
+                    continue
+
+                data_generation_cfg = config.get("data_generation")
+                training_cfg = config.get("training")
+
+                if not isinstance(data_generation_cfg, dict) or not isinstance(
+                    training_cfg, dict
+                ):
+                    print(
+                        "Skipping generated config: missing or malformed "
+                        "'data_generation'/'training' sections."
+                    )
+                    continue
+
                 config_key = (
-                    ("data_generation", tuple(sorted(config["data_generation"].items()))),
-                    ("training", tuple(sorted(config["training"].items()))),
+                    ("data_generation", tuple(sorted(data_generation_cfg.items()))),
+                    ("training", tuple(sorted(training_cfg.items()))),
                 )
 
                 if skip_repeated_configs and config_key in explored_configs[base_task_name]:
