@@ -4,7 +4,7 @@ import json
 import glob
 import numpy as np
 import torch
-from tqdm import tqdm
+from tqdm.auto import tqdm
 from typing import List, Optional
 from datetime import datetime
 from collections import Counter
@@ -580,143 +580,163 @@ def main(
             f"Requested {n_tasks} tasks but only {len(tasks)} available; limiting to {total_tasks}."
         )
 
-    for i in tqdm(range(total_tasks), desc="Self-edit tasks", unit="task"):
-        task = tasks[i]
+    progress_bar = tqdm(
+        total=total_tasks,
+        desc="Self-edit tasks",
+        unit="task",
+        position=2,
+        leave=True,
+        dynamic_ncols=True,
+    )
+    progress_bar.refresh()
+    try:
+        for i in range(total_tasks):
+            task = tasks[i]
 
-        # Get the base task name (without -0 or -1 suffix) skip if it has -1 suffix
-        base_task_name = task.name
-        if base_task_name.endswith("-0"):
-            base_task_name = base_task_name[:-2]
-        if base_task_name.endswith("-1"):
-            continue
-
-        if code_mode:
-            prompt_messages, _ = representer.encode(task)
-            prompt_text = tokenizer.apply_chat_template(
-                prompt_messages,
-                tokenize=False,
-                add_generation_prompt=True,
-            )
-        else:
-            prompt_text = get_prompt(task, system_message, self_edit_prompt)
-
-        # Initialize config/program tracking for this task
-        if base_task_name not in explored_configs:
-            explored_configs[base_task_name] = set()
-            task_configs[base_task_name] = []
-
-        expected_output = None
-        if getattr(task.test_example, "output", None) is not None:
-            expected_output = np.array(task.test_example.output)
-
-        while len(task_configs[base_task_name]) < n_self_edits_per_task:
-            response = self_edit_model.generate(prompt_text, sampling_params=sampling_params)
-            output = response[0].outputs[0]
+            # Get the base task name (without -0 or -1 suffix) skip if it has -1 suffix
+            base_task_name = task.name
+            if base_task_name.endswith("-0"):
+                base_task_name = base_task_name[:-2]
+            if base_task_name.endswith("-1"):
+                progress_bar.update(1)
+                continue
 
             if code_mode:
-                raw_response = output.text
-                code = extract_solver_code(raw_response)
-
-                if skip_repeated_configs and code and code in explored_configs[base_task_name]:
-                    print(f"Skipping already explored program for task {base_task_name}")
-                    continue
-
-                if code:
-                    explored_configs[base_task_name].add(code)
-
-                execution_payload = {
-                    "success": False,
-                    "error_type": None,
-                    "message": None,
-                    "stdout": "",
-                    "stderr": "",
-                }
-
-                reward = 0.0
-                success = False
-                predicted_output = None
-
-                if code:
-                    exec_result = run_solver(
-                        code,
-                        train_examples=task.train_examples,
-                        test_input=task.test_example.input,
-                    )
-                    execution_payload.update(
-                        {
-                            "success": exec_result.success,
-                            "error_type": exec_result.error_type,
-                            "message": exec_result.message,
-                            "stdout": exec_result.stdout,
-                            "stderr": exec_result.stderr,
-                        }
-                    )
-                    if exec_result.success and exec_result.output is not None:
-                        predicted_output = exec_result.output.tolist()
-                        execution_payload["output"] = predicted_output
-                        if expected_output is not None and np.array_equal(
-                            exec_result.output, expected_output
-                        ):
-                            success = True
-                            reward = 1.0
-                else:
-                    execution_payload.update(
-                        {
-                            "error_type": "CodeExtractionError",
-                            "message": "No executable code block found in response.",
-                        }
-                    )
-
-                prompt_messages_copy = [dict(message) for message in prompt_messages]
-                assistant_content = code if code else raw_response
-                chat_messages = prompt_messages_copy + [
-                    {"role": "assistant", "content": assistant_content}
-                ]
-
-                attempt_entry = {
-                    "prompt_messages": prompt_messages_copy,
-                    "prompt_text": prompt_text,
-                    "raw_response": raw_response,
-                    "code": code,
-                    "token_ids": output.token_ids,
-                    "execution": execution_payload,
-                    "reward": reward,
-                    "success": success,
-                    "chat_messages": chat_messages,
-                }
-
-                if predicted_output is not None:
-                    attempt_entry["predicted_output"] = predicted_output
-                if expected_output is not None:
-                    attempt_entry["target_output"] = expected_output.tolist()
-
-                if success and code:
-                    chat_text = tokenizer.apply_chat_template(
-                        chat_messages,
-                        tokenize=False,
-                        add_generation_prompt=False,
-                    )
-                    attempt_entry["full_text"] = chat_text
-                    try:
-                        tokenized = _tokenize_and_process(chat_text, tokenizer)
-                    except ValueError as error:
-                        print(
-                            f"Failed to tokenize successful program for {base_task_name}: {error}"
-                        )
-                        attempt_entry["tokenized"] = None
-                    else:
-                        attempt_entry["tokenized"] = tokenized
-                        attempt_entry["total_tokens"] = int(
-                            tokenized["attention_mask"].sum().item()
-                        )
-                else:
-                    attempt_entry["tokenized"] = None
-
-                task_configs[base_task_name].append(attempt_entry)
-                print(
-                    f"New program for task {base_task_name}: success={success}, reward={reward}"
+                prompt_messages, _ = representer.encode(task)
+                prompt_text = tokenizer.apply_chat_template(
+                    prompt_messages,
+                    tokenize=False,
+                    add_generation_prompt=True,
                 )
             else:
+                prompt_text = get_prompt(task, system_message, self_edit_prompt)
+
+            # Initialize config/program tracking for this task
+            if base_task_name not in explored_configs:
+                explored_configs[base_task_name] = set()
+                task_configs[base_task_name] = []
+
+            expected_output = None
+            if getattr(task.test_example, "output", None) is not None:
+                expected_output = np.array(task.test_example.output)
+
+            while len(task_configs[base_task_name]) < n_self_edits_per_task:
+                response = self_edit_model.generate(
+                    prompt_text, sampling_params=sampling_params
+                )
+                output = response[0].outputs[0]
+
+                if code_mode:
+                    raw_response = output.text
+                    code = extract_solver_code(raw_response)
+
+                    if (
+                        skip_repeated_configs
+                        and code
+                        and code in explored_configs[base_task_name]
+                    ):
+                        print(
+                            f"Skipping already explored program for task {base_task_name}"
+                        )
+                        continue
+
+                    if code:
+                        explored_configs[base_task_name].add(code)
+
+                    execution_payload = {
+                        "success": False,
+                        "error_type": None,
+                        "message": None,
+                        "stdout": "",
+                        "stderr": "",
+                    }
+
+                    reward = 0.0
+                    success = False
+                    predicted_output = None
+
+                    if code:
+                        exec_result = run_solver(
+                            code,
+                            train_examples=task.train_examples,
+                            test_input=task.test_example.input,
+                        )
+                        execution_payload.update(
+                            {
+                                "success": exec_result.success,
+                                "error_type": exec_result.error_type,
+                                "message": exec_result.message,
+                                "stdout": exec_result.stdout,
+                                "stderr": exec_result.stderr,
+                            }
+                        )
+                        if exec_result.success and exec_result.output is not None:
+                            predicted_output = exec_result.output.tolist()
+                            execution_payload["output"] = predicted_output
+                            if expected_output is not None and np.array_equal(
+                                exec_result.output, expected_output
+                            ):
+                                success = True
+                                reward = 1.0
+                    else:
+                        execution_payload.update(
+                            {
+                                "error_type": "CodeExtractionError",
+                                "message": "No executable code block found in response.",
+                            }
+                        )
+
+                    prompt_messages_copy = [dict(message) for message in prompt_messages]
+                    assistant_content = code if code else raw_response
+                    chat_messages = prompt_messages_copy + [
+                        {"role": "assistant", "content": assistant_content}
+                    ]
+
+                    attempt_entry = {
+                        "prompt_messages": prompt_messages_copy,
+                        "prompt_text": prompt_text,
+                        "raw_response": raw_response,
+                        "code": code,
+                        "token_ids": output.token_ids,
+                        "execution": execution_payload,
+                        "reward": reward,
+                        "success": success,
+                        "chat_messages": chat_messages,
+                    }
+
+                    if predicted_output is not None:
+                        attempt_entry["predicted_output"] = predicted_output
+                    if expected_output is not None:
+                        attempt_entry["target_output"] = expected_output.tolist()
+
+                    if success and code:
+                        chat_text = tokenizer.apply_chat_template(
+                            chat_messages,
+                            tokenize=False,
+                            add_generation_prompt=False,
+                        )
+                        attempt_entry["full_text"] = chat_text
+                        try:
+                            tokenized = _tokenize_and_process(chat_text, tokenizer)
+                        except ValueError as error:
+                            print(
+                                f"Failed to tokenize successful program for {base_task_name}: {error}"
+                            )
+                            attempt_entry["tokenized"] = None
+                        else:
+                            attempt_entry["tokenized"] = tokenized
+                            attempt_entry["total_tokens"] = int(
+                                tokenized["attention_mask"].sum().item()
+                            )
+                    else:
+                        attempt_entry["tokenized"] = None
+
+                    task_configs[base_task_name].append(attempt_entry)
+                    print(
+                        f"New program for task {base_task_name}: success={success}, reward={reward}"
+                    )
+                    continue
+
                 try:
                     config = json.loads(output.text)
                 except json.JSONDecodeError:
@@ -741,6 +761,10 @@ def main(
                     }
                 )
                 print(f"New config for task {base_task_name}:", config)
+
+            progress_bar.update(1)
+    finally:
+        progress_bar.close()
 
     # Delete self-edit model to free memory
     del self_edit_model
