@@ -196,7 +196,7 @@ id_to_lora_path = {}
 # get lora paths and filter tasks if necessary
 if args.lora_checkpoints_folder is not None:
     id_to_lora_path = {}
-    for lora_path in glob.glob(f"{args.lora_checkpoints_folder}/*/0"): # adapter_model.safetensors
+    for lora_path in glob.glob(f"{args.lora_checkpoints_folder}/*/0"):
         lora_id = lora_path.split("/")[-2]
         id_to_lora_path[lora_id] = lora_path
         lora_dir = os.path.dirname(lora_path)
@@ -287,11 +287,19 @@ inputs_to_remember = {}
 lora_path_idxs = list(id_to_lora_path.keys())
 
 if len(lora_path_idxs) > 0:
-    # load one adapter_config.json
-    with open(
-        id_to_lora_path[lora_path_idxs[0]] + "/adapter_config.json"
-    ) as f:
-        lora_adapter_config = json.load(f)
+    adapter_config_path = next(
+        (
+            os.path.join(base_path, "adapter_config.json")
+            for base_path in id_to_lora_path.values()
+            if os.path.isfile(os.path.join(base_path, "adapter_config.json"))
+        ),
+        None,
+    )
+    if adapter_config_path is not None:
+        with open(adapter_config_path) as f:
+            lora_adapter_config = json.load(f)
+    else:
+        lora_adapter_config = {}
 else:
     lora_adapter_config = {}
 
@@ -315,22 +323,41 @@ for lora_edit_idx in range(args.n_self_edits):
 
     inputs_to_the_engine = []
     inputs_to_remember = {}
+    skipped_tasks = {}
 
     for i, info in enumerate(valid_tasks):
         name = info["task"].name
         idx, no = name.split("-")
         if args.lora_checkpoints_folder is not None:
-            lora_path = id_to_lora_path[idx]
-            lora_path = os.path.dirname(lora_path) + f"/{lora_edit_idx}"
-            
-            # get the parent folder
+            base_lora_root = id_to_lora_path.get(idx)
+            if base_lora_root is None:
+                skipped_tasks[name] = "missing_base_lora"
+                print(
+                    f"No LoRA checkpoints found for task {idx}; "
+                    f"skipping evaluation for edit {lora_edit_idx}."
+                )
+                continue
+
+            lora_path = os.path.join(os.path.dirname(base_lora_root), str(lora_edit_idx))
+
             if args.use_all_lora:
-                lora_path = os.path.join(os.path.dirname(lora_path), "all/")
+                lora_path = os.path.join(os.path.dirname(lora_path), "all")
+
+            if not os.path.isdir(lora_path):
+                skipped_tasks[name] = "missing_edit_lora"
+                print(
+                    f"LoRA checkpoint path {lora_path} not found for task {idx} "
+                    f"edit {lora_edit_idx}; skipping."
+                )
+                continue
+
             lora_index = lora_path_idxs.index(idx)
 
             s = lora_index + lora_edit_idx
             unique_id = (s * (s + 1)) // 2 + lora_edit_idx
-            lora_request = LoRARequest(idx + no + '-' + str(lora_edit_idx), unique_id + 1, lora_path)
+            lora_request = LoRARequest(
+                idx + no + '-' + str(lora_edit_idx), unique_id + 1, lora_path
+            )
         else:
             lora_request = None
         test_inputs = info["queries"]
@@ -348,6 +375,18 @@ for lora_edit_idx in range(args.n_self_edits):
             )
             inputs_to_remember[name + "-" + str(j)] = test_input
 
+
+    if len(inputs_to_the_engine) == 0:
+        print(
+            f"No evaluation inputs constructed for edit {lora_edit_idx}; "
+            "skipping this iteration."
+        )
+        final_results[lora_edit_idx] = {
+            "status": "skipped",
+            "reason": "no_inputs",
+            "skipped_tasks": skipped_tasks,
+        }
+        continue
 
     print(f"Number of input queries to the engine: {len(inputs_to_the_engine)}")
 
@@ -479,13 +518,16 @@ for lora_edit_idx in range(args.n_self_edits):
     for task in tasks:
         name = task.name
 
-        to_vote = [
-            entry
-            for key, entries in outputs_by_key.items()
-            if name in key
-            for entry in entries
-            if "output" in entry
-        ]
+        to_vote = []
+        for key, entries in outputs_by_key.items():
+            if name not in key:
+                continue
+            for entry in entries:
+                if isinstance(entry, dict):
+                    if "output" in entry:
+                        to_vote.append(entry)
+                else:
+                    to_vote.append({"output": entry, "inverter": None})
 
         if len(to_vote) == 0:
             outputs[name] = [[[0]], [[0]]]
@@ -519,6 +561,19 @@ for lora_edit_idx in range(args.n_self_edits):
             "code_mode": True,
             "outputs_path": all_predictions_file,
         }
+
+    if skipped_tasks:
+        if hasattr(result_payload, "to_dict"):
+            payload = result_payload.to_dict()
+            payload["skipped_tasks"] = skipped_tasks
+            result_payload = payload
+        elif isinstance(result_payload, dict):
+            result_payload = {**result_payload, "skipped_tasks": skipped_tasks}
+        else:
+            result_payload = {
+                "result": result_payload,
+                "skipped_tasks": skipped_tasks,
+            }
 
     final_results[lora_edit_idx] = result_payload
 

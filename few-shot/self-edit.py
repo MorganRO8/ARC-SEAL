@@ -5,7 +5,7 @@ import glob
 import numpy as np
 import torch
 from tqdm.auto import tqdm
-from typing import List, Optional
+from typing import List, Optional, Tuple
 from datetime import datetime
 from collections import Counter
 from transformers import AutoTokenizer, AutoModelForCausalLM
@@ -144,6 +144,46 @@ class NumpyEncoder(json.JSONEncoder):
         if isinstance(obj, np.bool_):
             return bool(obj)
         return super(NumpyEncoder, self).default(obj)
+
+
+def score_grid_prediction(
+    predicted_output: Optional[np.ndarray],
+    expected_output: Optional[np.ndarray],
+) -> Tuple[float, Optional[int], Optional[int], Optional[str]]:
+    """Compute partial-credit reward for a predicted grid.
+
+    Returns a tuple of ``(reward, correct_cells, total_cells, reason)`` where
+    ``reason`` is ``None`` when a comparison was possible and a short string
+    describing why no reward was awarded otherwise.
+    """
+
+    if expected_output is None:
+        return 0.0, None, None, "missing_target"
+    if predicted_output is None:
+        return 0.0, None, None, "missing_prediction"
+
+    try:
+        predicted_array = np.asarray(predicted_output, dtype=int)
+    except (TypeError, ValueError):
+        return 0.0, None, None, "non_integer_prediction"
+
+    try:
+        expected_array = np.asarray(expected_output, dtype=int)
+    except (TypeError, ValueError):
+        return 0.0, None, None, "invalid_target"
+
+    if predicted_array.shape != expected_array.shape:
+        return 0.0, 0, int(expected_array.size), "shape_mismatch"
+
+    total_cells = int(expected_array.size)
+    if total_cells == 0:
+        return 0.0, 0, 0, "empty_target"
+
+    matches = predicted_array == expected_array
+    correct_cells = int(np.count_nonzero(matches))
+    reward = float(correct_cells) / float(total_cells) if total_cells else 0.0
+
+    return reward, correct_cells, total_cells, None
 
 
 def get_augmenters(
@@ -601,6 +641,8 @@ def main(
                 progress_bar.update(1)
                 continue
 
+            prompt_token_length = None
+            available_context = None
             if code_mode:
                 prompt_messages, _ = representer.encode(task)
                 prompt_text = tokenizer.apply_chat_template(
@@ -608,6 +650,62 @@ def main(
                     tokenize=False,
                     add_generation_prompt=True,
                 )
+
+                try:
+                    prompt_tokens = tokenizer(
+                        prompt_text,
+                        return_tensors="pt",
+                        add_special_tokens=False,
+                    )
+                except ValueError as error:
+                    print(
+                        "Failed to tokenize prompt for task"
+                        f" {base_task_name}: {error}"
+                    )
+                    progress_bar.update(1)
+                    continue
+
+                prompt_token_length = int(prompt_tokens["input_ids"].shape[-1])
+                if vllm_max_model_len and vllm_max_model_len > 0:
+                    max_model_len = vllm_max_model_len
+                else:
+                    max_model_len = getattr(
+                        getattr(self_edit_model, "llm_engine", None),
+                        "max_model_len",
+                        None,
+                    )
+                    if max_model_len is None and getattr(
+                        getattr(self_edit_model, "llm_engine", None),
+                        "model_config",
+                        None,
+                    ) is not None:
+                        max_model_len = getattr(
+                            self_edit_model.llm_engine.model_config,
+                            "max_model_len",
+                            None,
+                        )
+
+                if max_model_len is not None:
+                    available_context = max_model_len - (
+                        sampling_params.max_tokens or 0
+                    )
+                    if available_context <= 0:
+                        print(
+                            "No room for prompt tokens with current generation "
+                            f"budget (max_model_len={max_model_len}, "
+                            f"max_tokens={sampling_params.max_tokens})."
+                        )
+                        progress_bar.update(1)
+                        continue
+
+                    if prompt_token_length > available_context:
+                        print(
+                            f"Skipping task {base_task_name}: prompt requires "
+                            f"{prompt_token_length} tokens but only "
+                            f"{available_context} are available."
+                        )
+                        progress_bar.update(1)
+                        continue
             else:
                 prompt_text = get_prompt(task, system_message, self_edit_prompt)
 
@@ -621,9 +719,31 @@ def main(
                 expected_output = np.array(task.test_example.output)
 
             while len(task_configs[base_task_name]) < n_self_edits_per_task:
-                response = self_edit_model.generate(
-                    prompt_text, sampling_params=sampling_params
-                )
+                try:
+                    response = self_edit_model.generate(
+                        prompt_text, sampling_params=sampling_params
+                    )
+                except ValueError as error:
+                    if "maximum model length" in str(error).lower():
+                        if prompt_token_length is None and code_mode:
+                            print(
+                                f"Skipping task {base_task_name} due to context "
+                                f"overflow: {error}"
+                            )
+                        elif prompt_token_length is not None and available_context is not None:
+                            print(
+                                f"Skipping task {base_task_name}: prompt requires "
+                                f"{prompt_token_length} tokens but only "
+                                f"{available_context} are available."
+                            )
+                        else:
+                            print(
+                                f"Skipping task {base_task_name} due to context "
+                                f"overflow: {error}"
+                            )
+                        break
+                    else:
+                        raise
                 output = response[0].outputs[0]
 
                 if code_mode:
@@ -654,6 +774,10 @@ def main(
                     reward = 0.0
                     success = False
                     predicted_output = None
+                    predicted_array = None
+                    correct_cells = None
+                    total_cells = None
+                    reward_reason = None
 
                     if code:
                         exec_result = run_solver(
@@ -670,14 +794,31 @@ def main(
                                 "stderr": exec_result.stderr,
                             }
                         )
-                        if exec_result.success and exec_result.output is not None:
-                            predicted_output = exec_result.output.tolist()
+                        if exec_result.output is not None:
+                            predicted_array = exec_result.output
+                            predicted_output = predicted_array.tolist()
                             execution_payload["output"] = predicted_output
-                            if expected_output is not None and np.array_equal(
-                                exec_result.output, expected_output
-                            ):
-                                success = True
-                                reward = 1.0
+
+                            (
+                                reward,
+                                correct_cells,
+                                total_cells,
+                                reward_reason,
+                            ) = score_grid_prediction(predicted_array, expected_output)
+
+                            if expected_output is None:
+                                success = exec_result.success
+                            else:
+                                success = reward == 1.0
+                        else:
+                            if exec_result.success:
+                                if expected_output is None:
+                                    success = True
+                                reward_reason = "missing_prediction"
+                            else:
+                                reward_reason = (
+                                    exec_result.error_type or "execution_failed"
+                                )
                     else:
                         execution_payload.update(
                             {
@@ -708,8 +849,15 @@ def main(
                         attempt_entry["predicted_output"] = predicted_output
                     if expected_output is not None:
                         attempt_entry["target_output"] = expected_output.tolist()
+                    if correct_cells is not None:
+                        attempt_entry["correct_cells"] = correct_cells
+                    if total_cells is not None:
+                        attempt_entry["total_cells"] = total_cells
+                    if reward_reason is not None:
+                        attempt_entry["grid_evaluation_reason"] = reward_reason
+                        execution_payload["grid_evaluation_reason"] = reward_reason
 
-                    if success and code:
+                    if reward > 0 and code:
                         chat_text = tokenizer.apply_chat_template(
                             chat_messages,
                             tokenize=False,
@@ -732,8 +880,27 @@ def main(
                         attempt_entry["tokenized"] = None
 
                     task_configs[base_task_name].append(attempt_entry)
+                    reward_str = f"{reward:.3f}" if isinstance(reward, (int, float)) else reward
+                    if correct_cells is not None and total_cells is not None:
+                        progress_str = f" ({correct_cells}/{total_cells} cells)"
+                    else:
+                        progress_str = ""
+                    if reward_reason and reward == 0.0:
+                        detail = reward_reason
+                        if (
+                            reward_reason == "shape_mismatch"
+                            and predicted_array is not None
+                            and expected_output is not None
+                        ):
+                            detail = (
+                                f"shape_mismatch {predicted_array.shape}!= {expected_output.shape}"
+                            )
+                        progress_str = (
+                            f"{progress_str} [{detail}]" if progress_str else f"[{detail}]"
+                        )
                     print(
-                        f"New program for task {base_task_name}: success={success}, reward={reward}"
+                        f"New program for task {base_task_name}: success={success}, "
+                        f"reward={reward_str}{progress_str}"
                     )
                     continue
 
@@ -742,9 +909,28 @@ def main(
                 except json.JSONDecodeError:
                     continue
 
+                if not isinstance(config, dict):
+                    print(
+                        "Skipping generated config: expected a JSON object but received "
+                        f"{type(config).__name__}."
+                    )
+                    continue
+
+                data_generation_cfg = config.get("data_generation")
+                training_cfg = config.get("training")
+
+                if not isinstance(data_generation_cfg, dict) or not isinstance(
+                    training_cfg, dict
+                ):
+                    print(
+                        "Skipping generated config: missing or malformed "
+                        "'data_generation'/'training' sections."
+                    )
+                    continue
+
                 config_key = (
-                    ("data_generation", tuple(sorted(config["data_generation"].items()))),
-                    ("training", tuple(sorted(config["training"].items()))),
+                    ("data_generation", tuple(sorted(data_generation_cfg.items()))),
+                    ("training", tuple(sorted(training_cfg.items()))),
                 )
 
                 if skip_repeated_configs and config_key in explored_configs[base_task_name]:
@@ -790,11 +976,13 @@ def main(
             positive_attempts = [
                 attempt
                 for attempt in configs
-                if attempt.get("success") and attempt.get("tokenized") is not None
+                if attempt.get("reward", 0) > 0 and attempt.get("tokenized") is not None
             ]
 
             if not positive_attempts:
-                print(f"No successful programs for {base_task_name}; skipping fine-tuning.")
+                print(
+                    f"No rewarded programs for {base_task_name}; skipping fine-tuning."
+                )
                 final_configs_and_indices[base_task_name] = {}
                 continue
 
@@ -828,6 +1016,10 @@ def main(
                     attempt_summary["predicted_output"] = attempt["predicted_output"]
                 if "target_output" in attempt:
                     attempt_summary["target_output"] = attempt["target_output"]
+                if "correct_cells" in attempt:
+                    attempt_summary["correct_cells"] = attempt["correct_cells"]
+                if "total_cells" in attempt:
+                    attempt_summary["total_cells"] = attempt["total_cells"]
                 if attempt.get("total_tokens") is not None:
                     attempt_summary["total_tokens"] = attempt["total_tokens"]
                 sanitized_attempts.append(attempt_summary)

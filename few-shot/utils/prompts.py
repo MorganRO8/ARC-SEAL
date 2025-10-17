@@ -75,6 +75,12 @@ python_solver_user_template = dedent(
     {description}Training examples (Python dictionaries with \"input\" and \"output\" grids):
     {train_examples}
 
+    Grid dimension summary (rows × cols):
+    {grid_stats}
+
+    Getting the output grid dimensions correct is critical—predictions with the wrong height or width
+    are treated as incorrect regardless of their contents.
+
     Test example data:
     {test_example}
 

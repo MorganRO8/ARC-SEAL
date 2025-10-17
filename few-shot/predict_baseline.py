@@ -494,13 +494,16 @@ outputs = {}
 for task in tasks:
     name = task.name
 
-    to_vote = [
-        entry
-        for key, entries in outputs_by_key.items()
-        if name in key
-        for entry in entries
-        if "output" in entry
-    ]
+    to_vote = []
+    for key, entries in outputs_by_key.items():
+        if name not in key:
+            continue
+        for entry in entries:
+            if isinstance(entry, dict):
+                if "output" in entry:
+                    to_vote.append(entry)
+            else:
+                to_vote.append({"output": entry, "inverter": None})
 
     if len(to_vote) == 0:
         outputs[name] = [[[0]], [[0]]]

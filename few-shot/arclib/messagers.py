@@ -37,6 +37,63 @@ MESSAGE = Dict[str, Union[str, Dict]]
 MESSAGES = List[MESSAGE]
 
 
+def _format_grid_dimensions(grid) -> Optional[str]:
+    """Return a human-readable rows × cols string for a grid-like object."""
+
+    if grid is None:
+        return None
+
+    try:
+        array = np.asarray(grid)
+    except Exception:
+        return None
+
+    if array.ndim < 2:
+        if array.ndim == 1:
+            return f"{int(array.shape[0])}×1"
+        return None
+
+    rows, cols = array.shape[:2]
+    try:
+        rows_int = int(rows)
+        cols_int = int(cols)
+    except (TypeError, ValueError):
+        return None
+
+    return f"{rows_int}×{cols_int}"
+
+
+def _summarize_task_grid_dimensions(task: Task) -> str:
+    """Build a bullet-list summary of train/test grid dimensions for a task."""
+
+    lines: List[str] = []
+    for idx, example in enumerate(task.train_examples, start=1):
+        input_dims = _format_grid_dimensions(example.input)
+        output_dims = _format_grid_dimensions(example.output)
+        segments: List[str] = []
+        if input_dims:
+            segments.append(f"input {input_dims}")
+        if output_dims:
+            segments.append(f"output {output_dims}")
+        if segments:
+            lines.append(f"Train pair {idx}: " + ", ".join(segments))
+
+    test_input_dims = _format_grid_dimensions(task.test_example.input)
+    if test_input_dims:
+        lines.append(f"Test input: {test_input_dims}")
+
+    test_output = getattr(task.test_example, "output", None)
+    if test_output is not None:
+        test_output_dims = _format_grid_dimensions(test_output)
+        if test_output_dims:
+            lines.append(f"Test expected output: {test_output_dims}")
+
+    if not lines:
+        return "(no grid dimension metadata available)"
+
+    return "\n".join(f"- {line}" for line in lines)
+
+
 def display_messages(messages: MESSAGES):
     html_output = """<!DOCTYPE html>
     <html>
@@ -330,12 +387,15 @@ class PythonSolverMessageRepresenter(MessageRepresenter):
         if getattr(task.test_example, "output", None) is not None:
             test_payload["output"] = task.test_example.output.tolist()
 
+        grid_stats = _summarize_task_grid_dimensions(task)
+
         user_content = self.user_prompt_template.format(
             description=description,
             train_examples=json.dumps(train_examples, indent=4),
             test_example=json.dumps(test_payload, indent=4),
             function_signature=self.function_signature,
             function_docstring=self.function_docstring,
+            grid_stats=grid_stats,
         )
 
         input_messages = [
