@@ -31,20 +31,40 @@ def initialize_engine(
     quantization: Optional[str] = None,
     lora_repo: Optional[str] = None,
     lora_target_modules: Optional[List[str]] = None,
+    dtype: Optional[str] = "float16",
+    max_model_len: int = 8192,
+    max_num_batched_tokens: Optional[int] = None,
+    gpu_memory_utilization: Optional[float] = 0.9,
+    tensor_parallel_size: Optional[int] = 1,
 ) -> LLMEngine:
     """Initialize the LLMEngine."""
 
-    engine_args = EngineArgs(
+    engine_args_kwargs = dict(
         model=model,
         enable_lora=enable_lora,
         max_lora_rank=max_lora_rank,
         enforce_eager=enforce_eager,
         quantization=quantization,
-        #lora_target_modules=lora_target_modules,
         load_format="bitsandbytes" if quantization else "auto",
-        max_model_len=8192,
-        gpu_memory_utilization=0.9
+        max_model_len=max_model_len,
     )
+
+    if dtype:
+        engine_args_kwargs["dtype"] = dtype
+
+    if lora_target_modules is not None:
+        engine_args_kwargs["lora_target_modules"] = lora_target_modules
+
+    if max_num_batched_tokens is not None:
+        engine_args_kwargs["max_num_batched_tokens"] = max_num_batched_tokens
+
+    if gpu_memory_utilization is not None:
+        engine_args_kwargs["gpu_memory_utilization"] = gpu_memory_utilization
+
+    if tensor_parallel_size is not None:
+        engine_args_kwargs["tensor_parallel_size"] = tensor_parallel_size
+
+    engine_args = EngineArgs(**engine_args_kwargs)
 
     return LLMEngine.from_engine_args(engine_args)
 
