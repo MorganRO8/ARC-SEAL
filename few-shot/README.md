@@ -5,6 +5,37 @@ Code is adopted from: [Ekin's Repo](https://github.com/ekinakyurek/marc/tree/mai
 
 ## SEAL RL Iteration 1
 
+### Environment setup
+
+Create a fresh virtual environment (``python -m venv .venv``) and install the pinned dependencies from the repository root before running any of the commands below:
+
+```bash
+source .venv/bin/activate
+pip install --upgrade pip
+pip install -r requirements.txt  # run from the repository root
+```
+
+The dependency pins intentionally keep ``numpy`` on the 1.26 series so that the ``scikit-learn`` wheels pulled in by ``transformers`` remain binary compatible.  Installing the requirements inside a clean environment avoids the ``ValueError: numpy.dtype size changed`` crash that can arise when an older ``scikit-learn`` build from a base Conda installation is left alongside ``numpy`` 2.x.
+
+### Memory-safe defaults for local vLLM runs
+
+Scripts that launch a local vLLM engine (`self-edit.py`, `predict_baseline.py`, `predict_custom.py`, and the evaluation utilities) now accept a small set of flags that cap sequence length and KV-cache growth while forcing eager execution.  The defaults keep weights in FP16, limit batches to ~4k tokens, and reserve at most 60% of the GPU memory so 1–3B parameter checkpoints fit comfortably on 24 GB cards.  Override them as needed, e.g.:
+
+```bash
+python self-edit.py \
+    --experiment_name=training_set_iteration_1 \
+    --challenge_file=${DATA_DIR}/arc-agi_training_challenges_filtered_1B_training_set.json \
+    --solution_file=${DATA_DIR}/arc-agi_training_solutions_filtered_1B_training_set.json \
+    --model_name=TinyLlama/TinyLlama-1.1B-Chat-v1.0 \
+    --n_tasks=12 \
+    --n_self_edits_per_task=15 \
+    --vllm_max_model_len=3072 \
+    --vllm_gpu_memory_utilization=0.55 \
+    --vllm_max_num_batched_tokens=3072
+```
+
+Passing `--no_vllm_enforce_eager` re-enables `torch.compile` graph capture if you have additional headroom and want the extra throughput.
+
 ### 1. Training on 12 Problems (Iteration 1)
 
 Train the base model on 12 problems from ARC train set:
@@ -133,3 +164,60 @@ python self-edit.py \
 - The experiments are designed to iteratively improve performance through self-editing and reinforcement learning
 - Evaluation is performed on filtered ARC-AGI datasets for both training and evaluation sets
 - LoRA (Low-Rank Adaptation) is used for efficient fine-tuning with various rank configurations
+
+## Python code-generation mode
+
+Several scripts (`self-edit.py`, `predict_baseline.py`, `predict_custom.py`, `eval-self-edits.py`, and `eval-self-edits-baseline.py`)
+accept a `--code_mode` flag that switches the prompt formatting to the
+`PythonSolverMessageRepresenter`. In this configuration the model receives ARC grids as nested
+Python lists and must respond with executable Python code that defines the entry point below:
+
+```python
+from typing import List
+
+def solve(grid: List[List[int]]) -> List[List[int]]:
+    """Solve the ARC task for the provided test input grid.
+
+    Args:
+        grid: The test input grid represented as a list of lists of integers.
+
+    Returns:
+        A list of lists of integers representing the predicted output grid.
+    """
+    ...
+```
+
+The response must be valid Python source code (helper functions are allowed) and include the
+docstring exactly as shown. Only standard-library imports are permitted; the prompt explicitly
+allows modules such as `typing`, `collections`, `itertools`, `functools`, `math`, `statistics`,
+`heapq`, and `copy`. Downstream parsers expect the function to return a nested list of integers
+representing the predicted output grid.
+
+## Iterative self-improvement controller
+
+Use `few-shot/iterative_code_trainer.py` to run a local end-to-end self-improvement loop that
+samples candidate programs, executes them with the sandbox, logs replay data, and periodically
+fine-tunes a LoRA adapter on successful transcripts. The controller shares the same prompt builder
+and executor utilities as the inference scripts, enabling reproducible code-mode experiments.
+
+Example invocation:
+
+```bash
+python iterative_code_trainer.py \
+    --model /path/to/base-model \
+    --tasks data/arc-agi_training_challenges.json \
+    --solutions data/arc-agi_training_solutions.json \
+    --output-dir runs/iterative-training \
+    --tasks-per-iteration 4 \
+    --generations-per-task 6 \
+    --min-successes-for-update 8
+```
+
+Key outputs:
+
+- `replay.jsonl`: JSONL replay buffer with prompts, generated code, execution traces, and rewards.
+- `adapters/iter-XXXX/`: Saved LoRA adapters produced whenever the success threshold is met. The
+  script automatically loads the most recent adapter into the active inference model.
+
+Adjust the CLI flags to control sampling temperature, new-token limits, LoRA hyper-parameters, and
+update cadence to match the desired experimental protocol.

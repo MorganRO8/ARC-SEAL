@@ -1,6 +1,6 @@
 import os
 #os.environ["CUDA_VISIBLE_DEVICES"] = "1"
-from typing import Dict, Any, Callable, List, Optional, Union
+from typing import Dict, Any, Callable, List, Optional, Union, Sequence, Mapping
 from transformers import AutoModelForCausalLM, AutoTokenizer, TrainingArguments, Trainer
 from datasets import Dataset
 from tqdm import tqdm
@@ -10,6 +10,7 @@ import datetime
 import uuid
 
 from peft import LoraConfig, get_peft_model, TaskType, PeftModel
+from torch.nn.utils.rnn import pad_sequence
 from torch.utils.data import DataLoader
 
 from .arc import Example, Grid, Task
@@ -72,8 +73,8 @@ class TTT:
                 self.initial_lora_A[name] = param.data.clone().detach()
     
     def update_model(
-        self, 
-        task_text_list: List[str], 
+        self,
+        task_text_list: Sequence[Union[str, Mapping[str, torch.Tensor]]],
         output_dir: str,
         batch_size: int,
         gradient_accumulation_steps: int,
@@ -106,8 +107,18 @@ class TTT:
         # Reset the LoRA weights
         self.reset_lora()
         
-        # Create training data
-        training_data = self._tokenize_and_process(task_text_list, loss_on_all_tokens)
+        if not task_text_list:
+            print("No training samples provided; skipping fine-tuning.")
+            os.makedirs(output_dir, exist_ok=True)
+            self.model.save_pretrained(output_dir)
+            self.tokenizer.save_pretrained(output_dir)
+            return output_dir
+
+        first_sample = task_text_list[0]
+        if isinstance(first_sample, Mapping):
+            training_data = self._collate_tokenized_samples(task_text_list)  # type: ignore[arg-type]
+        else:
+            training_data = self._tokenize_and_process(task_text_list, loss_on_all_tokens)
         
         # clear cache
         torch.cuda.empty_cache()
@@ -164,35 +175,69 @@ class TTT:
         # Process all samples in parallel
         batch_size = input_ids.shape[0]
         labels = input_ids.clone()
-        
-        # Find special sequences and set labels for all samples in parallel
-        for i in range(batch_size):
-            if loss_on_all_tokens:
-                continue
 
-            sample_input_ids = input_ids[i].tolist()
-            
-            # Find all occurrences of the special sequence
-            # This is "<|start_header_id|>assistant<|end_header_id|>"
-            special_indices = []
-            for j in range(len(sample_input_ids) - 1):
-                if sample_input_ids[j] == 128007 and sample_input_ids[j + 1] == 271:
-                    special_indices.append(j + 1)  # include the 271 token in the conditioning
-            
-            # If we found multiple matches, use the second-to-last one
-            if len(special_indices) == 4:
-                special_index = special_indices[-2]
-            else:
-                print(f"Warning: Special sequence not found in sample {i}, using fallback strategy")
-                special_index = int(len(sample_input_ids) * 0.8)
-                assert False
-            
-            # Create labels: we want the model to predict tokens after the special sequence
-            for j in range(special_index + 1):
-                labels[i, j] = -100
-        
+        if not loss_on_all_tokens:
+            for i in range(batch_size):
+                sample_input_ids = input_ids[i].tolist()
+                special_indices = []
+                for j in range(len(sample_input_ids) - 1):
+                    if sample_input_ids[j] == 128007 and sample_input_ids[j + 1] == 271:
+                        special_indices.append(j + 1)
+
+                if not special_indices:
+                    print(
+                        f"Warning: Assistant header sequence not found in sample {i}; skipping loss masking."
+                    )
+                    labels[i, :] = -100
+                    continue
+
+                if len(special_indices) >= 2:
+                    special_index = special_indices[-2]
+                else:
+                    special_index = special_indices[-1]
+
+                labels[i, : special_index + 1] = -100
+
         outputs["labels"] = labels
         return outputs
+
+    def _collate_tokenized_samples(
+        self,
+        samples: Sequence[Mapping[str, torch.Tensor]],
+    ) -> Dict[str, torch.Tensor]:
+        input_tensors: List[torch.Tensor] = []
+        attention_tensors: List[torch.Tensor] = []
+        label_tensors: List[torch.Tensor] = []
+
+        for sample in samples:
+            input_tensor = sample["input_ids"]
+            attention_tensor = sample["attention_mask"]
+            label_tensor = sample["labels"]
+
+            if input_tensor.dim() > 1:
+                input_tensor = input_tensor.squeeze(0)
+            if attention_tensor.dim() > 1:
+                attention_tensor = attention_tensor.squeeze(0)
+            if label_tensor.dim() > 1:
+                label_tensor = label_tensor.squeeze(0)
+
+            input_tensors.append(input_tensor.cpu().to(torch.long))
+            attention_tensors.append(attention_tensor.cpu().to(torch.long))
+            label_tensors.append(label_tensor.cpu().to(torch.long))
+
+        padded_input = pad_sequence(
+            input_tensors,
+            batch_first=True,
+            padding_value=self.tokenizer.pad_token_id,
+        )
+        padded_attention = pad_sequence(attention_tensors, batch_first=True, padding_value=0)
+        padded_labels = pad_sequence(label_tensors, batch_first=True, padding_value=-100)
+
+        return {
+            "input_ids": padded_input,
+            "attention_mask": padded_attention,
+            "labels": padded_labels,
+        }
     
     def _train_model(
         self,

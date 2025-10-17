@@ -19,7 +19,11 @@ from arclib.arc import (
 )
 import arclib.augmenters  # noqa: F401 to prevent removal by black
 from arclib.eval import evaluate
-from arclib.messagers import GPTTextMessageRepresenterV2, GPTTextMessageRepresenterForBarc
+from arclib.messagers import (
+    GPTTextMessageRepresenterForBarc,
+    GPTTextMessageRepresenterV2,
+    PythonSolverMessageRepresenter,
+)
 from arclib.representers import (
     DiffExampleRepresenter,
     PythonListGridRepresenter,
@@ -30,6 +34,7 @@ from arclib.representers import (
 from arclib.voting import vote
 from inference.engine import get_sampling_params, initialize_engine, process_requests
 from inference.preprocess import get_preprocessed_tasks
+from utils.python_executor import extract_solver_code, run_solver
 
 
 parser = argparse.ArgumentParser(description="Process some integers.")
@@ -119,11 +124,64 @@ parser.add_argument(
     "--n_self_edits", type=int, required=True, help="Number of self edits to evaluate"
 )
 
+parser.add_argument(
+    "--code_mode",
+    action="store_true",
+    help="Format prompts for Python solver generation instead of grid outputs",
+)
+parser.add_argument(
+    "--vllm_dtype",
+    type=str,
+    default="float16",
+    choices=["auto", "float16", "bfloat16"],
+    help="Precision to use for vLLM weights (default: float16).",
+)
+parser.add_argument(
+    "--vllm_max_model_len",
+    type=int,
+    default=4096,
+    help="Upper bound on sequence length handed to vLLM (default: 4096).",
+)
+parser.add_argument(
+    "--vllm_max_num_batched_tokens",
+    type=int,
+    default=4096,
+    help="Cap the total tokens per batch to control KV cache size.",
+)
+parser.add_argument(
+    "--vllm_gpu_memory_utilization",
+    type=float,
+    default=0.6,
+    help="Fraction of GPU memory vLLM may reserve (default: 0.6).",
+)
+parser.add_argument(
+    "--vllm_tensor_parallel_size",
+    type=int,
+    default=1,
+    help="Tensor parallel world size for vLLM (default: 1).",
+)
+parser.add_argument(
+    "--vllm_enforce_eager",
+    dest="vllm_enforce_eager",
+    action="store_true",
+    help="Force eager execution to avoid torch.compile capture (default).",
+)
+parser.add_argument(
+    "--no_vllm_enforce_eager",
+    dest="vllm_enforce_eager",
+    action="store_false",
+    help="Disable eager enforcement when you have spare memory.",
+)
+parser.set_defaults(vllm_enforce_eager=True)
+
 args = parser.parse_args()
 
 # set seed
 np.random.seed(args.seed)
 torch.manual_seed(args.seed)
+
+if args.code_mode and (args.new_format or args.barc_format or args.add_diff_format):
+    raise ValueError("--code_mode cannot be combined with grid formatting flags.")
 
 # print args
 print("Arguments:")
@@ -138,7 +196,7 @@ id_to_lora_path = {}
 # get lora paths and filter tasks if necessary
 if args.lora_checkpoints_folder is not None:
     id_to_lora_path = {}
-    for lora_path in glob.glob(f"{args.lora_checkpoints_folder}/*/0"): # adapter_model.safetensors
+    for lora_path in glob.glob(f"{args.lora_checkpoints_folder}/*/0"):
         lora_id = lora_path.split("/")[-2]
         id_to_lora_path[lora_id] = lora_path
         lora_dir = os.path.dirname(lora_path)
@@ -150,7 +208,9 @@ if args.num_examples is not None:
     tasks = tasks[: args.num_examples]
 
 formatters = []
-if args.new_format:
+if args.code_mode:
+    formatters.append(PythonSolverMessageRepresenter())
+elif args.new_format:
     messager = GPTTextMessageRepresenterV2(
         task_representer=TextTaskRepresenter(
             example_representer=TextExampleRepresenter(
@@ -227,11 +287,19 @@ inputs_to_remember = {}
 lora_path_idxs = list(id_to_lora_path.keys())
 
 if len(lora_path_idxs) > 0:
-    # load one adapter_config.json
-    with open(
-        id_to_lora_path[lora_path_idxs[0]] + "/adapter_config.json"
-    ) as f:
-        lora_adapter_config = json.load(f)
+    adapter_config_path = next(
+        (
+            os.path.join(base_path, "adapter_config.json")
+            for base_path in id_to_lora_path.values()
+            if os.path.isfile(os.path.join(base_path, "adapter_config.json"))
+        ),
+        None,
+    )
+    if adapter_config_path is not None:
+        with open(adapter_config_path) as f:
+            lora_adapter_config = json.load(f)
+    else:
+        lora_adapter_config = {}
 else:
     lora_adapter_config = {}
 
@@ -240,8 +308,13 @@ engine = initialize_engine(
     quantization=args.quantization,
     max_lora_rank=lora_adapter_config.get("r", args.max_lora_rank),
     enable_lora=args.lora_checkpoints_folder is not None,
-    enforce_eager=False,
+    enforce_eager=args.vllm_enforce_eager,
     lora_target_modules=lora_adapter_config.get("target_modules", None),
+    dtype=args.vllm_dtype,
+    max_model_len=args.vllm_max_model_len,
+    max_num_batched_tokens=args.vllm_max_num_batched_tokens,
+    gpu_memory_utilization=args.vllm_gpu_memory_utilization,
+    tensor_parallel_size=args.vllm_tensor_parallel_size,
 )
 
 
@@ -250,22 +323,41 @@ for lora_edit_idx in range(args.n_self_edits):
 
     inputs_to_the_engine = []
     inputs_to_remember = {}
+    skipped_tasks = {}
 
     for i, info in enumerate(valid_tasks):
         name = info["task"].name
         idx, no = name.split("-")
         if args.lora_checkpoints_folder is not None:
-            lora_path = id_to_lora_path[idx]
-            lora_path = os.path.dirname(lora_path) + f"/{lora_edit_idx}"
-            
-            # get the parent folder
+            base_lora_root = id_to_lora_path.get(idx)
+            if base_lora_root is None:
+                skipped_tasks[name] = "missing_base_lora"
+                print(
+                    f"No LoRA checkpoints found for task {idx}; "
+                    f"skipping evaluation for edit {lora_edit_idx}."
+                )
+                continue
+
+            lora_path = os.path.join(os.path.dirname(base_lora_root), str(lora_edit_idx))
+
             if args.use_all_lora:
-                lora_path = os.path.join(os.path.dirname(lora_path), "all/")
+                lora_path = os.path.join(os.path.dirname(lora_path), "all")
+
+            if not os.path.isdir(lora_path):
+                skipped_tasks[name] = "missing_edit_lora"
+                print(
+                    f"LoRA checkpoint path {lora_path} not found for task {idx} "
+                    f"edit {lora_edit_idx}; skipping."
+                )
+                continue
+
             lora_index = lora_path_idxs.index(idx)
 
             s = lora_index + lora_edit_idx
             unique_id = (s * (s + 1)) // 2 + lora_edit_idx
-            lora_request = LoRARequest(idx + no + '-' + str(lora_edit_idx), unique_id + 1, lora_path)
+            lora_request = LoRARequest(
+                idx + no + '-' + str(lora_edit_idx), unique_id + 1, lora_path
+            )
         else:
             lora_request = None
         test_inputs = info["queries"]
@@ -284,6 +376,18 @@ for lora_edit_idx in range(args.n_self_edits):
             inputs_to_remember[name + "-" + str(j)] = test_input
 
 
+    if len(inputs_to_the_engine) == 0:
+        print(
+            f"No evaluation inputs constructed for edit {lora_edit_idx}; "
+            "skipping this iteration."
+        )
+        final_results[lora_edit_idx] = {
+            "status": "skipped",
+            "reason": "no_inputs",
+            "skipped_tasks": skipped_tasks,
+        }
+        continue
+
     print(f"Number of input queries to the engine: {len(inputs_to_the_engine)}")
 
     outputs_by_key = process_requests(engine, inputs_to_the_engine)
@@ -301,7 +405,69 @@ for lora_edit_idx in range(args.n_self_edits):
         input = inputs_to_remember[key]["input"]["content"]
         current_formatter = eval(current_formatter_repr)
 
+        task_obj = inputs_to_remember[key]["task"]
+
         for output in outputs:
+            if args.code_mode:
+                code = extract_solver_code(output)
+                exec_result = run_solver(
+                    code,
+                    train_examples=task_obj.train_examples,
+                    test_input=task_obj.test_example.input,
+                )
+
+                if exec_result.success and exec_result.output is not None:
+                    try:
+                        normalized = to_tuple(inverter_fn(exec_result.output))
+                    except Exception as error:
+                        print(f"Failed to apply inverter for {key}: {error}")
+                        outputs_by_key[key].append(
+                            {
+                                "status": "error",
+                                "error_type": "InverterFailure",
+                                "message": str(error),
+                                "code": code,
+                                "stdout": exec_result.stdout,
+                                "stderr": exec_result.stderr,
+                                "formatter": current_formatter_repr,
+                                "inverter": inverter,
+                                "raw_response": output,
+                            }
+                        )
+                        continue
+
+                    outputs_by_key[key].append(
+                        {
+                            "status": "ok",
+                            "output": normalized,
+                            "code": code,
+                            "stdout": exec_result.stdout,
+                            "stderr": exec_result.stderr,
+                            "inverter": inverter,
+                            "formatter": current_formatter_repr,
+                            "raw_response": output,
+                        }
+                    )
+                else:
+                    print(
+                        f"Solver execution failed for {key}: "
+                        f"{exec_result.error_type}: {exec_result.message}"
+                    )
+                    outputs_by_key[key].append(
+                        {
+                            "status": "error",
+                            "error_type": exec_result.error_type or "ExecutionError",
+                            "message": exec_result.message,
+                            "code": code,
+                            "stdout": exec_result.stdout,
+                            "stderr": exec_result.stderr,
+                            "inverter": inverter,
+                            "formatter": current_formatter_repr,
+                            "raw_response": output,
+                        }
+                    )
+                continue
+
             output = output.replace("#", "")
             output = output.replace("  ", " ")
             if "```" in output:
@@ -343,14 +509,25 @@ for lora_edit_idx in range(args.n_self_edits):
     all_predictions_file = os.path.join(args.experiment_folder, "all_predictions.json")
 
     with open(all_predictions_file, "w") as f:
-        json.dump(outputs_by_key, f)
+        json.dump(outputs_by_key, f, indent=2)
+
+    if args.code_mode:
+        print("Code mode enabled; solver outputs saved to all_predictions.json.")
 
     outputs = {}
     for task in tasks:
         name = task.name
 
-        to_vote = [out for key, out in outputs_by_key.items() if name in key]
-        to_vote = [out for sublist in to_vote for out in sublist]
+        to_vote = []
+        for key, entries in outputs_by_key.items():
+            if name not in key:
+                continue
+            for entry in entries:
+                if isinstance(entry, dict):
+                    if "output" in entry:
+                        to_vote.append(entry)
+                else:
+                    to_vote.append({"output": entry, "inverter": None})
 
         if len(to_vote) == 0:
             outputs[name] = [[[0]], [[0]]]
@@ -367,14 +544,44 @@ for lora_edit_idx in range(args.n_self_edits):
     print(f"Submission file is saved to {submission_file}")
 
     # evaluate
+    result_payload = {}
     if args.solution_file is not None:
         task_info = evaluate(args.data_file, args.solution_file, submission_file)
-        final_results[lora_edit_idx] = task_info
+        result_payload = task_info
+
+    if args.code_mode:
+        if hasattr(result_payload, "to_dict"):
+            metrics = result_payload.to_dict()
+        elif isinstance(result_payload, dict):
+            metrics = result_payload
+        else:
+            metrics = {"result": result_payload}
+        result_payload = {
+            "metrics": metrics,
+            "code_mode": True,
+            "outputs_path": all_predictions_file,
+        }
+
+    if skipped_tasks:
+        if hasattr(result_payload, "to_dict"):
+            payload = result_payload.to_dict()
+            payload["skipped_tasks"] = skipped_tasks
+            result_payload = payload
+        elif isinstance(result_payload, dict):
+            result_payload = {**result_payload, "skipped_tasks": skipped_tasks}
+        else:
+            result_payload = {
+                "result": result_payload,
+                "skipped_tasks": skipped_tasks,
+            }
+
+    final_results[lora_edit_idx] = result_payload
 
 print(final_results)
 # save final results
-for k in final_results.keys():
-    final_results[k] = final_results[k].to_dict()
+for k, value in list(final_results.items()):
+    if hasattr(value, "to_dict"):
+        final_results[k] = value.to_dict()
 
 with open(os.path.join("final_results.json"), "w") as f:
     json.dump(final_results, f)

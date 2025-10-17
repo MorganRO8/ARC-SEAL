@@ -18,7 +18,11 @@ from arclib.arc import (
 )
 import arclib.augmenters  # noqa: F401 to prevent removal by black
 from arclib.eval import evaluate
-from arclib.messagers import GPTTextMessageRepresenterV2, GPTTextMessageRepresenterForBarc
+from arclib.messagers import (
+    GPTTextMessageRepresenterForBarc,
+    GPTTextMessageRepresenterV2,
+    PythonSolverMessageRepresenter,
+)
 from arclib.representers import (
     DiffExampleRepresenter,
     PythonListGridRepresenter,
@@ -30,6 +34,7 @@ from arclib.voting import vote
 from inference.engine_no_lora import get_sampling_params, initialize_engine, process_requests
 from inference.preprocess import get_preprocessed_tasks
 from vllm.lora.request import LoRARequest
+from utils.python_executor import extract_solver_code, run_solver
 
 
 parser = argparse.ArgumentParser(description="Process some integers.")
@@ -115,11 +120,64 @@ parser.add_argument(
     "--use_all_lora", action="store_true", help="single trained lora"
 )
 
+parser.add_argument(
+    "--code_mode",
+    action="store_true",
+    help="Format prompts for Python solver generation instead of grid outputs",
+)
+parser.add_argument(
+    "--vllm_dtype",
+    type=str,
+    default="float16",
+    choices=["auto", "float16", "bfloat16"],
+    help="Precision to use for vLLM weights (default: float16).",
+)
+parser.add_argument(
+    "--vllm_max_model_len",
+    type=int,
+    default=4096,
+    help="Upper bound on sequence length handed to vLLM (default: 4096).",
+)
+parser.add_argument(
+    "--vllm_max_num_batched_tokens",
+    type=int,
+    default=4096,
+    help="Cap the total tokens per batch to control KV cache size.",
+)
+parser.add_argument(
+    "--vllm_gpu_memory_utilization",
+    type=float,
+    default=0.6,
+    help="Fraction of GPU memory vLLM may reserve (default: 0.6).",
+)
+parser.add_argument(
+    "--vllm_tensor_parallel_size",
+    type=int,
+    default=1,
+    help="Tensor parallel world size for vLLM (default: 1).",
+)
+parser.add_argument(
+    "--vllm_enforce_eager",
+    dest="vllm_enforce_eager",
+    action="store_true",
+    help="Force eager execution to avoid torch.compile capture (default).",
+)
+parser.add_argument(
+    "--no_vllm_enforce_eager",
+    dest="vllm_enforce_eager",
+    action="store_false",
+    help="Disable eager enforcement when you have spare memory.",
+)
+parser.set_defaults(vllm_enforce_eager=True)
+
 args = parser.parse_args()
 
 # set seed
 np.random.seed(args.seed)
 torch.manual_seed(args.seed)
+
+if args.code_mode and (args.new_format or args.barc_format or args.add_diff_format):
+    raise ValueError("--code_mode cannot be combined with grid formatting flags.")
 
 # print args
 print("Arguments:")
@@ -146,7 +204,9 @@ if args.num_examples is not None:
     tasks = tasks[: args.num_examples]
 
 formatters = []
-if args.new_format:
+if args.code_mode:
+    formatters.append(PythonSolverMessageRepresenter())
+elif args.new_format:
     messager = GPTTextMessageRepresenterV2(
         task_representer=TextTaskRepresenter(
             example_representer=TextExampleRepresenter(
@@ -236,8 +296,13 @@ engine = initialize_engine(
     quantization=args.quantization,
     max_lora_rank=lora_adapter_config.get("r", args.max_lora_rank),
     enable_lora=args.lora_checkpoints_folder is not None,
-    enforce_eager=False,
+    enforce_eager=args.vllm_enforce_eager,
     lora_target_modules=lora_adapter_config.get("target_modules", None),
+    dtype=args.vllm_dtype,
+    max_model_len=args.vllm_max_model_len,
+    max_num_batched_tokens=args.vllm_max_num_batched_tokens,
+    gpu_memory_utilization=args.vllm_gpu_memory_utilization,
+    tensor_parallel_size=args.vllm_tensor_parallel_size,
 )
 
 
@@ -274,6 +339,8 @@ print(f"Number of input queries to the engine: {len(inputs_to_the_engine)}")
 
 outputs_by_key = process_requests(engine, inputs_to_the_engine)
 
+code_attempts = {}
+
 for key in list(outputs_by_key.keys()):
     inverter = inputs_to_remember[key]["inverter"]
     if inverter is not None:
@@ -287,7 +354,90 @@ for key in list(outputs_by_key.keys()):
     input = inputs_to_remember[key]["input"]["content"]
     current_formatter = eval(current_formatter_repr)
 
+    task_obj = inputs_to_remember[key]["task"]
+
     for output in outputs:
+        if args.code_mode:
+            code = extract_solver_code(output)
+            attempt_record = {
+                "code": code,
+                "raw_response": output,
+            }
+            code_attempts.setdefault(key, []).append(attempt_record)
+            exec_result = run_solver(
+                code,
+                train_examples=task_obj.train_examples,
+                test_input=task_obj.test_example.input,
+            )
+
+            if exec_result.success and exec_result.output is not None:
+                attempt_record.update(
+                    {
+                        "status": "ok",
+                        "stdout": exec_result.stdout,
+                        "stderr": exec_result.stderr,
+                    }
+                )
+                try:
+                    normalized = to_tuple(inverter_fn(exec_result.output))
+                except Exception as error:
+                    print(f"Failed to apply inverter for {key}: {error}")
+                    outputs_by_key[key].append(
+                        {
+                            "status": "error",
+                            "error_type": "InverterFailure",
+                            "message": str(error),
+                            "code": code,
+                            "stdout": exec_result.stdout,
+                            "stderr": exec_result.stderr,
+                            "formatter": current_formatter_repr,
+                            "inverter": inverter,
+                            "raw_response": output,
+                        }
+                    )
+                    continue
+
+                outputs_by_key[key].append(
+                    {
+                        "status": "ok",
+                        "output": normalized,
+                        "code": code,
+                        "stdout": exec_result.stdout,
+                        "stderr": exec_result.stderr,
+                        "inverter": inverter,
+                        "formatter": current_formatter_repr,
+                        "raw_response": output,
+                    }
+                )
+            else:
+                attempt_record.update(
+                    {
+                        "status": "error",
+                        "error_type": exec_result.error_type,
+                        "message": exec_result.message,
+                        "stdout": exec_result.stdout,
+                        "stderr": exec_result.stderr,
+                    }
+                )
+                print(
+                    f"Solver execution failed for {key}: "
+                    f"{exec_result.error_type}: {exec_result.message}"
+                )
+                outputs_by_key[key].append(
+                    {
+                        "status": "error",
+                        "error_type": exec_result.error_type or "ExecutionError",
+                        "message": exec_result.message,
+                        "code": code,
+                        "stdout": exec_result.stdout,
+                        "stderr": exec_result.stderr,
+                        "inverter": inverter,
+                        "formatter": current_formatter_repr,
+                        "raw_response": output,
+                    }
+                )
+            continue
+
         output = output.replace("#", "")
         output = output.replace("  ", " ")
         if "```" in output:
@@ -329,14 +479,31 @@ outputs_by_key = {key: outputs for key, outputs in outputs_by_key.items() if len
 all_predictions_file = os.path.join(args.experiment_folder, "all_predictions.json")
 
 with open(all_predictions_file, "w") as f:
-    json.dump(outputs_by_key, f)
+    json.dump(outputs_by_key, f, indent=2)
+
+if args.code_mode:
+    code_attempts_file = os.path.join(args.experiment_folder, "all_code_attempts.json")
+    with open(code_attempts_file, "w") as f:
+        json.dump(code_attempts, f, indent=2)
+    print(
+        "Code mode enabled; solver outputs saved to all_predictions.json and "
+        "all_code_attempts.json."
+    )
 
 outputs = {}
 for task in tasks:
     name = task.name
 
-    to_vote = [out for key, out in outputs_by_key.items() if name in key]
-    to_vote = [out for sublist in to_vote for out in sublist]
+    to_vote = []
+    for key, entries in outputs_by_key.items():
+        if name not in key:
+            continue
+        for entry in entries:
+            if isinstance(entry, dict):
+                if "output" in entry:
+                    to_vote.append(entry)
+            else:
+                to_vote.append({"output": entry, "inverter": None})
 
     if len(to_vote) == 0:
         outputs[name] = [[[0]], [[0]]]

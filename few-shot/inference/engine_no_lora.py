@@ -25,12 +25,17 @@ def get_sampling_params(
 
 def initialize_engine(
     model: str,
-    enforce_eager: bool = False,
+    enforce_eager: bool = True,
     enable_lora: bool = True,
     max_lora_rank: int = 64,
     quantization: Optional[str] = None,
     lora_repo: Optional[str] = None,
     lora_target_modules: Optional[List[str]] = None,
+    dtype: str = "float16",
+    max_model_len: int = 4096,
+    max_num_batched_tokens: int = 4096,
+    gpu_memory_utilization: float = 0.6,
+    tensor_parallel_size: int = 1,
 ) -> LLMEngine:
     """Initialize the LLMEngine."""
 
@@ -38,10 +43,13 @@ def initialize_engine(
         model=model,
         enforce_eager=enforce_eager,
         quantization=quantization,
-        #lora_target_modules=lora_target_modules,
+        # lora_target_modules=lora_target_modules,
         load_format="bitsandbytes" if quantization else "auto",
-        max_model_len=8192,
-        gpu_memory_utilization=0.9,
+        dtype=dtype,
+        max_model_len=max_model_len,
+        max_num_batched_tokens=max_num_batched_tokens,
+        gpu_memory_utilization=gpu_memory_utilization,
+        tensor_parallel_size=tensor_parallel_size,
     )
 
     return LLMEngine.from_engine_args(engine_args)

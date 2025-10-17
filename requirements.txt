@@ -7,11 +7,10 @@ peft==0.15.2
 rich==14.0.0
 vllm==0.9.1
 trl==0.18.1
-openai==1.86.0
-litellm==1.72.4
 pyzmq==27.0.0
 tqdm==4.67.1
-numpy==2.2.6
-scipy==1.15.3
-matplotlib==3.10.3
+numpy==1.26.4
+scipy==1.11.4
+scikit-learn==1.5.2
+matplotlib==3.8.4
 flashinfer-python==0.2.2

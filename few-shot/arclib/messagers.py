@@ -1,6 +1,7 @@
 """
 This module contains classes for representing tasks and examples as messages for chat-based interfaces.
 """
+import json
 from abc import ABC, abstractmethod
 from html import escape
 from typing import Dict, List, Optional, Tuple, Union
@@ -21,6 +22,14 @@ from .representers import (
     TextTaskRepresenter,
     TextExampleRepresenter,
     WordGridRepresenter,
+)
+
+from utils.prompts import (
+    python_solver_function_docstring,
+    python_solver_function_signature,
+    python_solver_response_stub,
+    python_solver_system_prompt,
+    python_solver_user_template,
 )
 
 
@@ -281,6 +290,75 @@ class GPTTextMessageRepresenterV2(MessageRepresenter):
 
     def __repr__(self) -> str:
         return f"GPTTextMessageRepresenterV2(prompt={self.prompt!r}, task_representer={repr(self.task_representer)})"
+
+
+class PythonSolverMessageRepresenter(MessageRepresenter):
+    def __init__(
+        self,
+        system_prompt: str = python_solver_system_prompt,
+        user_prompt_template: str = python_solver_user_template,
+        function_signature: str = python_solver_function_signature,
+        function_docstring: str = python_solver_function_docstring,
+        task_representer: TaskRepresenter = TextTaskRepresenter(
+            example_representer=TextExampleRepresenter(
+                io_sep="",
+                input_header="",
+                output_header="",
+                grid_representer=PythonListGridRepresenter(),
+            )
+        ),
+        response_stub: str = python_solver_response_stub,
+    ):
+        self.system_prompt = system_prompt
+        self.user_prompt_template = user_prompt_template
+        self.function_signature = function_signature
+        self.function_docstring = function_docstring
+        self.task_representer = task_representer
+        self.response_stub = response_stub
+
+    def encode(self, task: Task, **kwargs) -> Tuple[MESSAGES, MESSAGE]:
+        description = ""
+        if getattr(task, "description", None):
+            description = f"Task description:\n{task.description.strip()}\n\n"
+
+        train_examples = [
+            {"input": example.input.tolist(), "output": example.output.tolist()}
+            for example in task.train_examples
+        ]
+
+        test_payload = {"input": task.test_example.input.tolist()}
+        if getattr(task.test_example, "output", None) is not None:
+            test_payload["output"] = task.test_example.output.tolist()
+
+        user_content = self.user_prompt_template.format(
+            description=description,
+            train_examples=json.dumps(train_examples, indent=4),
+            test_example=json.dumps(test_payload, indent=4),
+            function_signature=self.function_signature,
+            function_docstring=self.function_docstring,
+        )
+
+        input_messages = [
+            {"role": "system", "content": self.system_prompt},
+            {"role": "user", "content": user_content},
+        ]
+
+        assistant_message = {"role": "assistant", "content": self.response_stub}
+
+        return input_messages, assistant_message
+
+    def decode(self, input_data: MESSAGES, output_data: MESSAGE, **kwargs) -> Task:
+        raise NotImplementedError("Decoding for PythonSolverMessageRepresenter is not implemented.")
+
+    def __repr__(self) -> str:
+        return (
+            "PythonSolverMessageRepresenter("
+            f"system_prompt={self.system_prompt!r}, "
+            f"user_prompt_template={self.user_prompt_template!r}, "
+            f"function_signature={self.function_signature!r}, "
+            f"function_docstring={self.function_docstring!r}, "
+            f"task_representer={repr(self.task_representer)})"
+        )
 
 
 class GPTTextMessageRepresenterV2CoT(MessageRepresenter):
