@@ -276,6 +276,7 @@ def run_solver(
     )
     process.start()
 
+    exit_code: Optional[int] = None
     try:
         process.join(timeout)
         if process.is_alive():
@@ -286,6 +287,7 @@ def run_solver(
                 error_type="Timeout",
                 message=f"Execution timed out after {timeout} seconds.",
             )
+        exit_code = process.exitcode
     finally:
         # Drain any lingering data if the process exited early to avoid deadlocks.
         try:
@@ -306,7 +308,8 @@ def run_solver(
         pass
 
     if payload is None:
-        exit_code = process.exitcode
+        if exit_code is None:
+            exit_code = process.exitcode
         if exit_code not in (0, None):
             return SolverResult(
                 success=False,
