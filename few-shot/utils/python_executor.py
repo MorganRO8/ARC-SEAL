@@ -127,7 +127,13 @@ def extract_solver_code(response: str) -> str:
                 return candidate.strip()
         return candidates[0].strip()
 
-    return response.strip()
+    stripped = response.strip()
+    if stripped.startswith("```"):
+        import re
+
+        stripped = re.sub(r"^```(?:python)?", "", stripped, flags=re.IGNORECASE).lstrip()
+        stripped = re.sub(r"```$", "", stripped).rstrip()
+    return stripped
 
 
 def _serialize_examples(examples: Iterable[ExampleLike]) -> List[Mapping[str, List[List[int]]]]:
