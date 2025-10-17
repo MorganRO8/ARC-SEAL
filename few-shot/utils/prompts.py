@@ -85,6 +85,8 @@ python_solver_user_template = dedent(
     Output grid size guidance:
     {size_guidance}
 
+    {helper_section}
+
     Execution constraints and runtime guidance:
     {runtime_guidance}
 

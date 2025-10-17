@@ -5,6 +5,7 @@ import os
 import re
 import textwrap
 from collections import Counter
+import hashlib
 from copy import deepcopy
 from datetime import datetime
 from typing import Any, Dict, List, Optional, Tuple
@@ -82,6 +83,7 @@ from utils.output_size_inference import infer_output_shape
 from utils.prompts import self_edit_prompt, system_message
 from utils.chat_template import detect_thinking_support
 from utils.python_executor import SolverResult, extract_solver_code, run_solver
+from utils.solver_helpers import HelperLibrary, get_helper_library
 
 
 def mode_array(array_list):
@@ -370,6 +372,11 @@ def _serialize_solver_result(result: Optional[SolverResult]) -> Dict[str, Any]:
             payload["output"] = result.output.tolist()
         else:
             payload["output"] = result.output
+    payload["helper_error"] = bool(result.helper_error)
+    if result.helper_exception_type is not None:
+        payload["helper_exception_type"] = result.helper_exception_type
+    if result.helper_function is not None:
+        payload["helper_function"] = result.helper_function
     return payload
 
 
@@ -755,6 +762,7 @@ def main(
     vllm_gpu_memory_utilization: float = 0.6,
     vllm_enforce_eager: bool = True,
     vllm_tensor_parallel_size: int = 1,
+    include_solver_helpers: bool = False,
 ):
     # lora config
     lora_config = LoraConfig(
@@ -787,6 +795,25 @@ def main(
         )
 
         representer = GPTTextMessageRepresenterV2(task_representer=standard_formatter)
+
+    helper_library: Optional[HelperLibrary] = None
+    helper_prompt_overview: Optional[str] = None
+    helper_prompt_api: Optional[str] = None
+    helper_prompt_source: Optional[str] = None
+    helper_namespace: str = "ARC_HELPERS"
+    helper_source_digest: Optional[str] = None
+
+    if code_mode and include_solver_helpers:
+        helper_library = get_helper_library()
+        helper_prompt_overview = helper_library.prompt_overview
+        helper_prompt_api = helper_library.api_reference
+        helper_prompt_source = helper_library.source
+        helper_namespace = helper_library.namespace
+        helper_source_digest = hashlib.sha256(helper_library.source.encode("utf-8")).hexdigest()
+        print(
+            "Including solver helper library under namespace",
+            helper_namespace,
+        )
 
     solver_timeout = max(float(solver_timeout), 0.1)
     if solver_cpu_time_limit is None:
@@ -898,6 +925,10 @@ def main(
                     task,
                     size_inference=(size_hint, size_metadata),
                     execution_limits=execution_limits_payload,
+                    helper_overview=helper_prompt_overview,
+                    helper_api_reference=helper_prompt_api,
+                    helper_source=helper_prompt_source,
+                    helper_namespace=helper_namespace,
                 )
                 base_prompt_messages = [deepcopy(message) for message in encoded_messages]
 
@@ -1078,6 +1109,20 @@ def main(
                             "cpu_time_limit_s": solver_cpu_time_limit_s,
                             "memory_limit_mb": solver_memory_limit_value,
                         }
+                        helper_info_payload: Dict[str, Any] = {
+                            "included": helper_library is not None,
+                            "helper_error": False,
+                            "helper_exception_type": None,
+                            "helper_function": None,
+                        }
+                        if helper_library is not None:
+                            helper_info_payload.update(
+                                {
+                                    "namespace": helper_library.namespace,
+                                    "source_sha256": helper_source_digest,
+                                }
+                            )
+                        execution_payload["solver_helpers"] = helper_info_payload
                         execution_attempts: List[Dict[str, Any]] = []
 
                         local_reward = 0.0
@@ -1103,6 +1148,7 @@ def main(
                                 timeout=solver_timeout,
                                 memory_limit_mb=solver_memory_limit_value,
                                 cpu_time_limit_s=solver_cpu_time_limit_s,
+                                helper_library=helper_library,
                             )
                             execution_attempts.append(
                                 {
@@ -1113,6 +1159,14 @@ def main(
                             )
                             if local_exec_result.exit_code is not None:
                                 execution_payload["exit_code"] = local_exec_result.exit_code
+                            if helper_library is not None:
+                                helper_info_payload.update(
+                                    {
+                                        "helper_error": bool(local_exec_result.helper_error),
+                                        "helper_exception_type": local_exec_result.helper_exception_type,
+                                        "helper_function": local_exec_result.helper_function,
+                                    }
+                                )
 
                             if _needs_indentation_fix(local_exec_result):
                                 local_formatting_result = try_fix_indentation(
@@ -1131,6 +1185,7 @@ def main(
                                         timeout=solver_timeout,
                                         memory_limit_mb=solver_memory_limit_value,
                                         cpu_time_limit_s=solver_cpu_time_limit_s,
+                                        helper_library=helper_library,
                                     )
                                     execution_attempts.append(
                                         {
@@ -1144,6 +1199,14 @@ def main(
                                     if local_exec_result.exit_code is not None:
                                         execution_payload["exit_code"] = (
                                             local_exec_result.exit_code
+                                        )
+                                    if helper_library is not None:
+                                        helper_info_payload.update(
+                                            {
+                                                "helper_error": bool(local_exec_result.helper_error),
+                                                "helper_exception_type": local_exec_result.helper_exception_type,
+                                                "helper_function": local_exec_result.helper_function,
+                                            }
                                         )
                         elif code and local_rejection_reason is not None:
                             local_reward_reason = "rejected_unbounded_loop"
@@ -1278,6 +1341,16 @@ def main(
                         "chat_messages": chat_messages,
                         "retry_history": attempt_retry_history,
                     }
+
+                    solver_helpers_entry = dict(execution_payload.get("solver_helpers", {}))
+                    if helper_library is not None:
+                        solver_helpers_entry.setdefault("namespace", helper_library.namespace)
+                        solver_helpers_entry.setdefault("source_sha256", helper_source_digest)
+                        if helper_prompt_overview is not None:
+                            solver_helpers_entry.setdefault("prompt_overview", helper_prompt_overview)
+                        if helper_prompt_api is not None:
+                            solver_helpers_entry.setdefault("api_reference", helper_prompt_api)
+                    attempt_entry["solver_helpers"] = solver_helpers_entry
 
                     if local_predicted_output is not None:
                         attempt_entry["predicted_output"] = local_predicted_output
@@ -1674,6 +1747,8 @@ if __name__ == "__main__":
                       help='Force eager execution to avoid torch.compile capture (default).')
     parser.add_argument('--no_vllm_enforce_eager', dest='vllm_enforce_eager', action='store_false',
                       help='Disable eager enforcement if you prefer torch.compile graphs.')
+    parser.add_argument('--include_solver_helpers', action='store_true',
+                      help='Expose the curated ARC solver helper library to code-mode runs and describe it in prompts.')
     parser.set_defaults(vllm_enforce_eager=True)
 
     args = parser.parse_args()
@@ -1702,6 +1777,7 @@ if __name__ == "__main__":
         vllm_gpu_memory_utilization=args.vllm_gpu_memory_utilization,
         vllm_enforce_eager=args.vllm_enforce_eager,
         vllm_tensor_parallel_size=args.vllm_tensor_parallel_size,
+        include_solver_helpers=args.include_solver_helpers,
     )
     
    

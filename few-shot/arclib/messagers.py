@@ -446,6 +446,31 @@ class PythonSolverMessageRepresenter(MessageRepresenter):
         grid_stats = _summarize_task_grid_dimensions(task, inferred_shape)
         size_guidance = _format_size_guidance(inferred_shape, inference_details)
 
+        helper_overview = kwargs.get("helper_overview")
+        helper_api_reference = kwargs.get("helper_api_reference")
+        helper_source = kwargs.get("helper_source")
+        helper_namespace = kwargs.get("helper_namespace", "ARC_HELPERS")
+
+        helper_sections: List[str] = []
+        if helper_overview or helper_api_reference or helper_source:
+            helper_sections.append(
+                "Helper library available as ``%s`` with reusable ARC utilities." % helper_namespace
+            )
+            if helper_overview:
+                helper_sections.append(helper_overview)
+            if helper_api_reference:
+                helper_sections.append(f"API reference:\n{helper_api_reference}")
+            if helper_source:
+                helper_sections.append(
+                    "Helper source code (read-only reference):\n```python\n"
+                    + helper_source
+                    + "\n```"
+                )
+        else:
+            helper_sections.append("No helper library is loaded for this run.")
+
+        helper_section = "\n\n".join(helper_sections)
+
         user_content = self.user_prompt_template.format(
             description=description,
             train_examples=json.dumps(train_examples, indent=4),
@@ -455,6 +480,7 @@ class PythonSolverMessageRepresenter(MessageRepresenter):
             grid_stats=grid_stats,
             size_guidance=size_guidance,
             runtime_guidance=runtime_guidance,
+            helper_section=helper_section,
         )
 
         input_messages = [

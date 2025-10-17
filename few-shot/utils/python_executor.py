@@ -11,7 +11,19 @@ import signal
 import traceback
 from contextlib import redirect_stderr, redirect_stdout
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Iterable, List, Mapping, Optional, Sequence, Tuple, Union
+from pathlib import Path
+from typing import (
+    TYPE_CHECKING,
+    Iterable,
+    List,
+    Mapping,
+    Optional,
+    Sequence,
+    Tuple,
+    Union,
+)
+
+import types
 
 import numpy as np
 
@@ -22,6 +34,8 @@ except ImportError:  # pragma: no cover
 
 if TYPE_CHECKING:  # pragma: no cover
     from arclib.arc import Example
+
+from utils.solver_helpers import HelperLibrary
 
 GridLike = Sequence[Sequence[int]]
 ExampleLike = Union["Example", Mapping[str, GridLike]]
@@ -100,6 +114,9 @@ class SolverResult:
     stdout: str = ""
     stderr: str = ""
     exit_code: Optional[int] = None
+    helper_error: bool = False
+    helper_exception_type: Optional[str] = None
+    helper_function: Optional[str] = None
 
 
 def _describe_signal_exit(exit_code: int) -> Optional[Tuple[str, str]]:
@@ -206,6 +223,7 @@ def _worker(
     result_queue: multiprocessing.Queue,
     memory_limit_bytes: Optional[int],
     cpu_time_limit_s: Optional[int],
+    helper_library: Optional[HelperLibrary],
 ) -> None:
     stdout_buffer = io.StringIO()
     stderr_buffer = io.StringIO()
@@ -232,6 +250,10 @@ def _worker(
             "TEST_INPUT": test_input,
         }
 
+        if helper_library is not None:
+            namespace = types.SimpleNamespace(**helper_library.functions)
+            globals_dict[helper_library.namespace] = namespace
+
         with redirect_stdout(stdout_buffer), redirect_stderr(stderr_buffer):
             exec(code, globals_dict)
             solver = globals_dict.get("solve")
@@ -253,17 +275,49 @@ def _worker(
                 "output": output_array.tolist(),
                 "stdout": stdout_buffer.getvalue(),
                 "stderr": stderr_buffer.getvalue(),
+                "helper_error": False,
+                "helper_exception_type": None,
+                "helper_function": None,
             }
         )
     except Exception as exc:  # pragma: no cover - error paths covered via unit tests
+        helper_error = False
+        helper_exception_type: Optional[str] = None
+        helper_function: Optional[str] = None
+        message = str(exc)
+        if helper_library is not None and exc.__traceback__ is not None:
+            target_path = helper_library.module_filename
+            for frame in traceback.extract_tb(exc.__traceback__):
+                try:
+                    frame_path = str(Path(frame.filename).resolve())
+                    target_resolved = str(Path(target_path).resolve())
+                except Exception:  # pragma: no cover - platform dependent
+                    frame_path = frame.filename
+                    target_resolved = target_path
+                if frame_path == target_resolved:
+                    helper_error = True
+                    helper_exception_type = exc.__class__.__name__
+                    helper_function = frame.name
+                    message = (
+                        f"Helper '{helper_function}' raised {helper_exception_type}: {exc}"
+                    )
+                    break
+
+        error_type = exc.__class__.__name__
+        if helper_error:
+            error_type = "HelperExecutionError"
+
         result_queue.put(
             {
                 "status": "error",
-                "error_type": exc.__class__.__name__,
-                "message": str(exc),
+                "error_type": error_type,
+                "message": message,
                 "traceback": traceback.format_exc(),
                 "stdout": stdout_buffer.getvalue(),
                 "stderr": stderr_buffer.getvalue(),
+                "helper_error": helper_error,
+                "helper_exception_type": helper_exception_type,
+                "helper_function": helper_function,
             }
         )
     finally:
@@ -279,6 +333,7 @@ def run_solver(
     timeout: float = 5.0,
     memory_limit_mb: Optional[int] = 512,
     cpu_time_limit_s: Optional[int] = 5,
+    helper_library: Optional[HelperLibrary] = None,
 ) -> SolverResult:
     """Execute ``code_str`` safely and return the resulting grid or error."""
 
@@ -307,7 +362,15 @@ def run_solver(
 
     process = ctx.Process(
         target=_worker,
-        args=(code_str, serialized_examples, test_grid, result_queue, memory_limit_bytes, cpu_time_limit_s),
+        args=(
+            code_str,
+            serialized_examples,
+            test_grid,
+            result_queue,
+            memory_limit_bytes,
+            cpu_time_limit_s,
+            helper_library,
+        ),
     )
     process.start()
 
@@ -377,6 +440,9 @@ def run_solver(
             stdout=payload.get("stdout", ""),
             stderr=payload.get("stderr", ""),
             exit_code=0,
+            helper_error=bool(payload.get("helper_error", False)),
+            helper_exception_type=payload.get("helper_exception_type"),
+            helper_function=payload.get("helper_function"),
         )
 
     return SolverResult(
@@ -386,6 +452,9 @@ def run_solver(
         stdout=payload.get("stdout", ""),
         stderr=payload.get("stderr", ""),
         exit_code=exit_code,
+        helper_error=bool(payload.get("helper_error", False)),
+        helper_exception_type=payload.get("helper_exception_type"),
+        helper_function=payload.get("helper_function"),
     )
 
 
