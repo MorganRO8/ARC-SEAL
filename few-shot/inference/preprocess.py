@@ -1,5 +1,5 @@
 import itertools
-from typing import Any, Dict, List, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
 
@@ -77,7 +77,13 @@ def get_augmented_test_tasks(
     return augmented_tests
 
 
-def format_and_filter(formatter: Any, tokenizer: Any, task: Task) -> Dict[str, Any]:
+def format_and_filter(
+    formatter: Any,
+    tokenizer: Any,
+    task: Task,
+    *,
+    chat_template_kwargs: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
     encoded_task = formatter.encode(task)
     if encoded_task[0] is None:
         return None
@@ -85,14 +91,22 @@ def format_and_filter(formatter: Any, tokenizer: Any, task: Task) -> Dict[str, A
     # just to get the total tokens
     # this is kind of using output
     # but normally in test we will have outputs filled by input
+    extra_kwargs = dict(chat_template_kwargs or {})
+
     messages_w_output = tokenizer.apply_chat_template(
-        data["input"] + [data["output"]], tokenize=False, add_generation_prompt=True
+        data["input"] + [data["output"]],
+        tokenize=False,
+        add_generation_prompt=True,
+        **extra_kwargs,
     )
     total_tokens = len(tokenizer.encode(messages_w_output))
     del messages_w_output
     # this is the real query
     messages = tokenizer.apply_chat_template(
-        data["input"], tokenize=False, add_generation_prompt=True
+        data["input"],
+        tokenize=False,
+        add_generation_prompt=True,
+        **extra_kwargs,
     )
     if hasattr(task, "inverter"):
         inverter = task.inverter
@@ -116,13 +130,24 @@ def format_and_filter(formatter: Any, tokenizer: Any, task: Task) -> Dict[str, A
 
 
 def get_formatted_test_tasks(
-    task: Task, formatters: Any, tokenizer: Any, include_n: List[int] = [0, 1], permute_n: int = 2
+    task: Task,
+    formatters: Any,
+    tokenizer: Any,
+    include_n: List[int] = [0, 1],
+    permute_n: int = 2,
+    *,
+    chat_template_kwargs: Optional[Dict[str, Any]] = None,
 ) -> List[Dict[str, Any]]:
     formatted_tasks = []
     augmented_tests = get_augmented_test_tasks(task, include_n=include_n, permute_n=permute_n)
     for augmented_test in augmented_tests:
         for formatter in formatters:
-            formatted_task = format_and_filter(formatter, tokenizer, augmented_test)
+            formatted_task = format_and_filter(
+                formatter,
+                tokenizer,
+                augmented_test,
+                chat_template_kwargs=chat_template_kwargs,
+            )
             if formatted_task is not None:
                 formatted_tasks.append(formatted_task)
     return formatted_tasks
@@ -135,9 +160,16 @@ def get_preprocessed_tasks_single(
     max_tokens: int = 8192,
     include_n: List[int] = [0],
     permute_n: int = 2,
+    *,
+    chat_template_kwargs: Optional[Dict[str, Any]] = None,
 ):
     queries = get_formatted_test_tasks(
-        task, formatters, tokenizer, include_n=include_n, permute_n=permute_n
+        task,
+        formatters,
+        tokenizer,
+        include_n=include_n,
+        permute_n=permute_n,
+        chat_template_kwargs=chat_template_kwargs,
     )
     filtered_queries = [query for query in queries if query["total_tokens"] < max_tokens]
     if len(filtered_queries) == 0:
@@ -147,6 +179,7 @@ def get_preprocessed_tasks_single(
             tokenizer,
             include_n=include_n + [include_n[-1] + 1],
             permute_n=permute_n,
+            chat_template_kwargs=chat_template_kwargs,
         )
         filtered_queries = [query for query in queries if query["total_tokens"] < max_tokens]
     return {"valid": len(filtered_queries) > 0, "task": task, "queries": filtered_queries}
@@ -160,6 +193,8 @@ def get_preprocessed_tasks(
     include_n: List[int] = [0],
     id_to_lora_path: Dict[str, str] = {},
     permute_n: int = 2,
+    *,
+    chat_template_kwargs: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Dict[str, Any]]:
     task_name_to_processed_data = {}
     print("len(id_to_lora_path)", len(id_to_lora_path))
@@ -176,6 +211,7 @@ def get_preprocessed_tasks(
                 max_tokens=max_tokens,
                 include_n=include_n,
                 permute_n=permute_n,
+                chat_template_kwargs=chat_template_kwargs,
             )
 
     return task_name_to_processed_data

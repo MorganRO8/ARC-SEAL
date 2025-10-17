@@ -36,6 +36,7 @@ from arclib.arc import Task, read_tasks_from_file, read_tasks_from_folder, read_
 from arclib.messagers import PythonSolverMessageRepresenter
 from arclib.update_model import TTT
 from utils.python_executor import extract_solver_code, run_solver
+from utils.chat_template import detect_thinking_support
 
 
 DEFAULT_LORA_TARGETS = ["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "down_proj", "up_proj"]
@@ -208,12 +209,15 @@ def format_prompt(
     tokenizer,
     representer: PythonSolverMessageRepresenter,
     task: Task,
+    *,
+    chat_template_kwargs: Optional[Dict[str, Any]] = None,
 ) -> Tuple[List[Mapping[str, str]], str]:
     prompt_messages, _ = representer.encode(task)
     prompt_text = tokenizer.apply_chat_template(
         prompt_messages,
         tokenize=False,
         add_generation_prompt=True,
+        **dict(chat_template_kwargs or {}),
     )
     return prompt_messages, prompt_text
 
@@ -376,6 +380,14 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
 
+    thinking_config = detect_thinking_support(tokenizer)
+    chat_template_kwargs = dict(thinking_config.apply_chat_kwargs)
+    if thinking_config.enabled:
+        reason = thinking_config.reason or "detected thinking tokens"
+        print(f"Enabling thinking support in chat template ({reason}).")
+    else:
+        chat_template_kwargs = {}
+
     representer = PythonSolverMessageRepresenter()
 
     total_attempts = 0
@@ -394,7 +406,12 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
             batch_tasks = tasks[start_idx:end_idx]
             tqdm_desc = f"Iteration {iteration+1}/{max_iterations}"
             for task in tqdm(batch_tasks, desc=tqdm_desc):
-                prompt_messages, prompt_text = format_prompt(tokenizer, representer, task)
+                prompt_messages, prompt_text = format_prompt(
+                    tokenizer,
+                    representer,
+                    task,
+                    chat_template_kwargs=chat_template_kwargs,
+                )
 
                 try:
                     generations = generate_programs(
@@ -470,6 +487,7 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
                             chat_messages,
                             tokenize=False,
                             add_generation_prompt=False,
+                            **dict(chat_template_kwargs or {}),
                         )
                         try:
                             tokenized = _tokenize_chat_transcript(chat_text, tokenizer)

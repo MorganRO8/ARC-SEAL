@@ -80,6 +80,7 @@ from vllm import LLM, SamplingParams
 from utils.code_formatting import FormattingResult, try_fix_indentation
 from utils.output_size_inference import infer_output_shape
 from utils.prompts import self_edit_prompt, system_message
+from utils.chat_template import detect_thinking_support
 from utils.python_executor import SolverResult, extract_solver_code, run_solver
 
 
@@ -498,6 +499,7 @@ def format_and_filter(
     train_on_input: bool = False,
     *,
     code_mode: bool = False,
+    chat_template_kwargs: Optional[Dict[str, Any]] = None,
 ):
     if code_mode:
         chat_messages = task.get("chat_messages")
@@ -507,12 +509,15 @@ def format_and_filter(
         assistant_message = chat_messages[-1]
         prompt_messages = chat_messages[:-1]
 
+        extra_kwargs = dict(chat_template_kwargs or {})
+
         chat_text = task.get("full_text")
         if chat_text is None:
             chat_text = tokenizer.apply_chat_template(
                 chat_messages,
                 tokenize=False,
                 add_generation_prompt=False,
+                **extra_kwargs,
             )
 
         tokenized = task.get("tokenized")
@@ -539,10 +544,12 @@ def format_and_filter(
     encoded_messages = formatter.encode(task)
     data = {"input": encoded_messages[0], "output": encoded_messages[1]}
     chat_messages = data["input"] + [data["output"]]
+    extra_kwargs = dict(chat_template_kwargs or {})
     task_text = tokenizer.apply_chat_template(
         chat_messages,
         tokenize=False,
         add_generation_prompt=True,
+        **extra_kwargs,
     )
 
     try:
@@ -619,6 +626,8 @@ def get_formatted_data(
     permute_n: int = 1,
     seed: int = 0,
     max_tokens: int = 8192,
+    *,
+    chat_template_kwargs: Optional[Dict[str, Any]] = None,
 ):
 
     train_data = get_test_time_train_data(
@@ -632,6 +641,7 @@ def get_formatted_data(
             tokenizer,
             task,
             train_on_input=False,
+            chat_template_kwargs=chat_template_kwargs,
         )
         if formatted is not None and formatted["total_tokens"] < max_tokens:
             formatted_data.append(formatted)
@@ -652,6 +662,7 @@ def process_task(
     code_mode: bool = False,
     transcripts: Optional[List[dict]] = None,
     max_tokens: int = 8192,
+    chat_template_kwargs: Optional[Dict[str, Any]] = None,
 ):
     rng = np.random.RandomState(seed)
 
@@ -667,6 +678,7 @@ def process_task(
                 sample,
                 train_on_input=False,
                 code_mode=True,
+                chat_template_kwargs=chat_template_kwargs,
             )
             if formatted is not None and formatted["total_tokens"] < max_tokens:
                 formatted_samples.append(formatted)
@@ -681,7 +693,14 @@ def process_task(
     # Generate training data for each n in leave_n
     for n in leave_n:
         leave_n_train_data = get_formatted_data(
-            task, augmenters, formatter, tokenizer, leave_n=n, permute_n=permute_n, seed=seed
+            task,
+            augmenters,
+            formatter,
+            tokenizer,
+            leave_n=n,
+            permute_n=permute_n,
+            seed=seed,
+            chat_template_kwargs=chat_template_kwargs,
         )
         train.extend(leave_n_train_data)
 
@@ -800,6 +819,14 @@ def main(
     # Setup tokenizer and model
     tokenizer = AutoTokenizer.from_pretrained(model_name)
 
+    thinking_config = detect_thinking_support(tokenizer)
+    chat_template_kwargs = dict(thinking_config.apply_chat_kwargs)
+    if thinking_config.enabled:
+        reason = thinking_config.reason or "detected thinking tokens"
+        print(f"Enabling thinking support in chat template ({reason}).")
+    else:
+        chat_template_kwargs = {}
+
     # Phase 1: Generate configs using self-edit model
     print("Phase 1: Generating configs using self-edit model...")
     llm_kwargs = {}
@@ -879,6 +906,7 @@ def main(
                         messages,
                         tokenize=False,
                         add_generation_prompt=True,
+                        **chat_template_kwargs,
                     )
                     prompt_tokens = tokenizer(
                         prompt_text_local,
@@ -1287,6 +1315,7 @@ def main(
                             chat_messages,
                             tokenize=False,
                             add_generation_prompt=False,
+                            **dict(chat_template_kwargs or {}),
                         )
                         attempt_entry["full_text"] = chat_text
                         try:
@@ -1550,7 +1579,8 @@ def main(
                 leave_n=[1,2],
                 permute_n=1,
                 Nmax=250,
-                seed=0
+                seed=0,
+                chat_template_kwargs=chat_template_kwargs,
             )
 
             if len(train_data) == 0:

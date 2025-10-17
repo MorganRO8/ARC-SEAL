@@ -5,7 +5,7 @@ import glob
 import numpy as np
 import torch
 from tqdm import tqdm
-from typing import List, Optional
+from typing import Dict, List, Optional
 from datetime import datetime
 from collections import Counter
 from transformers import AutoTokenizer
@@ -29,6 +29,7 @@ from arclib.representers import (
 from arclib.messagers import GPTTextMessageRepresenterForBarc, GPTTextMessageRepresenterV2
 from arclib.update_model import TTT
 from inference.preprocess import get_preprocessed_tasks_single
+from utils.chat_template import detect_thinking_support
 
 import itertools
 from typing import List
@@ -237,10 +238,23 @@ def _tokenize_and_process(text: str, tokenizer):
     outputs["labels"] = labels
     return outputs
 
-def format_and_filter(formatter, tokenizer, task, train_on_input: False):
+def format_and_filter(
+    formatter,
+    tokenizer,
+    task,
+    train_on_input: False,
+    *,
+    chat_template_kwargs: Optional[Dict[str, Any]] = None,
+):
     task = formatter.encode(task)
     data = {"input": task[0], "output": task[1]}
-    task_text = tokenizer.apply_chat_template(task[0] + [task[1]], tokenize=False, add_generation_prompt=True)
+    extra_kwargs = dict(chat_template_kwargs or {})
+    task_text = tokenizer.apply_chat_template(
+        task[0] + [task[1]],
+        tokenize=False,
+        add_generation_prompt=True,
+        **extra_kwargs,
+    )
     #messages = arc_to_messages(data, train_on_input=False)
     outputs = _tokenize_and_process(task_text, tokenizer)
     data["total_tokens"] = len(outputs["input_ids"])
@@ -306,6 +320,8 @@ def get_formatted_data(
     permute_n: int = 1,
     seed: int = 0,
     max_tokens: int = 8192,
+    *,
+    chat_template_kwargs: Optional[Dict[str, Any]] = None,
 ):
 
     train_data = get_test_time_train_data(
@@ -314,7 +330,13 @@ def get_formatted_data(
 
     formatted_data = []
     for task in train_data:
-        formatted = format_and_filter(formatter, tokenizer, task, train_on_input=False)
+        formatted = format_and_filter(
+            formatter,
+            tokenizer,
+            task,
+            train_on_input=False,
+            chat_template_kwargs=chat_template_kwargs,
+        )
         if formatted["total_tokens"] < max_tokens:
             formatted_data.append(formatted)
 
@@ -330,6 +352,8 @@ def process_task(
     permute_n: int = 1,
     Nmax: int = 250,
     seed: int = 0,
+    *,
+    chat_template_kwargs: Optional[Dict[str, Any]] = None,
 ):
     rng = np.random.RandomState(seed)
     
@@ -337,7 +361,14 @@ def process_task(
     # Generate training data for each n in leave_n
     for n in leave_n:
         leave_n_train_data = get_formatted_data(
-            task, augmenters, formatter, tokenizer, leave_n=n, permute_n=permute_n, seed=seed
+            task,
+            augmenters,
+            formatter,
+            tokenizer,
+            leave_n=n,
+            permute_n=permute_n,
+            seed=seed,
+            chat_template_kwargs=chat_template_kwargs,
         )
         train.extend(leave_n_train_data)
 
@@ -394,6 +425,14 @@ def main():
     model_name = "meta-llama/Llama-3.2-1B-Instruct"
     tokenizer = AutoTokenizer.from_pretrained(model_name)
 
+    thinking_config = detect_thinking_support(tokenizer)
+    chat_template_kwargs = dict(thinking_config.apply_chat_kwargs)
+    if thinking_config.enabled:
+        reason = thinking_config.reason or "detected thinking tokens"
+        print(f"Enabling thinking support in chat template ({reason}).")
+    else:
+        chat_template_kwargs = {}
+
     # setup ttt 
     ttt = TTT(
         model_name=model_name,
@@ -427,7 +466,8 @@ def main():
             leave_n=self_edit["leave_n"],
             permute_n=1,
             Nmax=250,
-            seed=0
+            seed=0,
+            chat_template_kwargs=chat_template_kwargs,
         )
 
         if len(train_data) == 0:

@@ -35,6 +35,7 @@ from inference.engine_no_lora import get_sampling_params, initialize_engine, pro
 from inference.preprocess import get_preprocessed_tasks
 from vllm.lora.request import LoRARequest
 from utils.python_executor import extract_solver_code, run_solver
+from utils.chat_template import detect_thinking_support
 
 
 parser = argparse.ArgumentParser(description="Process some integers.")
@@ -250,6 +251,14 @@ if args.add_diff_format:
 
 tokenizer = AutoTokenizer.from_pretrained(args.pretrained_checkpoint)
 
+thinking_config = detect_thinking_support(tokenizer)
+chat_template_kwargs = dict(thinking_config.apply_chat_kwargs)
+if thinking_config.enabled:
+    reason = thinking_config.reason or "detected thinking tokens"
+    print(f"Enabling thinking support in chat template ({reason}).")
+else:
+    chat_template_kwargs = {}
+
 task_name_to_processed_data = get_preprocessed_tasks(
     tasks,
     tokenizer,
@@ -258,6 +267,7 @@ task_name_to_processed_data = get_preprocessed_tasks(
     id_to_lora_path=id_to_lora_path,
     include_n=args.include_n,
     permute_n=args.permute_n,
+    chat_template_kwargs=chat_template_kwargs,
 )
 valid_tasks = [info for key, info in task_name_to_processed_data.items() if info["valid"]]
 invalid_tasks = [info for key, info in task_name_to_processed_data.items() if not info["valid"]]
