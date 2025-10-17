@@ -25,6 +25,7 @@ from .representers import (
 )
 
 from utils.prompts import (
+    format_runtime_constraints,
     python_solver_function_docstring,
     python_solver_function_signature,
     python_solver_response_stub,
@@ -422,6 +423,13 @@ class PythonSolverMessageRepresenter(MessageRepresenter):
         else:
             inferred_shape, inference_details = size_inference
 
+        execution_limits = kwargs.get("execution_limits") or {}
+        runtime_guidance = format_runtime_constraints(
+            execution_limits.get("timeout"),
+            execution_limits.get("cpu_time_limit"),
+            execution_limits.get("memory_limit_mb"),
+        )
+
         description = ""
         if getattr(task, "description", None):
             description = f"Task description:\n{task.description.strip()}\n\n"
@@ -446,6 +454,7 @@ class PythonSolverMessageRepresenter(MessageRepresenter):
             function_docstring=self.function_docstring,
             grid_stats=grid_stats,
             size_guidance=size_guidance,
+            runtime_guidance=runtime_guidance,
         )
 
         input_messages = [

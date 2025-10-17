@@ -1,6 +1,7 @@
 
 # for self-edit.py
 from textwrap import dedent
+from typing import Optional
 
 
 self_edit_prompt = """
@@ -52,6 +53,9 @@ python_solver_system_prompt = dedent(
     Produce deterministic solutions that work for the provided train/test grids.
     Only import from the Python standard library. You may use: typing (List), collections, itertools,
     functools, math, statistics, heapq, and copy. Avoid any file system, network, or OS side effects.
+    Keep programs efficient and ensure every loop has a clear termination condition—unbounded or
+    extremely slow searches will be cancelled.
+    The sandbox enforces strict runtime and resource budgets; exceeding them terminates execution.
     Your response must be valid Python source code without additional commentary.
     """
 ).strip()
@@ -81,6 +85,9 @@ python_solver_user_template = dedent(
     Output grid size guidance:
     {size_guidance}
 
+    Execution constraints and runtime guidance:
+    {runtime_guidance}
+
     Getting the output grid dimensions correct is critical—predictions with the wrong height or width
     are treated as incorrect regardless of their contents.
 
@@ -109,3 +116,46 @@ def build_python_solver_response_stub() -> str:
 
 
 python_solver_response_stub = build_python_solver_response_stub()
+
+
+def format_runtime_constraints(
+    timeout: Optional[float],
+    cpu_time_limit: Optional[int],
+    memory_limit_mb: Optional[int],
+) -> str:
+    """Render the sandbox execution limits into guidance text."""
+
+    guidance_lines = []
+
+    if timeout is not None:
+        guidance_lines.append(
+            f"- Wall-clock timeout per execution: {timeout:.1f} seconds."
+        )
+
+    if cpu_time_limit is None:
+        guidance_lines.append(
+            "- CPU time limit: disabled for this run, but all loops must still terminate quickly."
+        )
+    else:
+        guidance_lines.append(
+            "- CPU time budget: "
+            f"{cpu_time_limit} seconds before the process receives SIGXCPU."
+        )
+
+    if memory_limit_mb is None:
+        guidance_lines.append(
+            "- Memory limit: soft limit only; avoid allocating large intermediate grids."
+        )
+    else:
+        guidance_lines.append(
+            f"- Memory limit: approximately {memory_limit_mb} MiB of address space."
+        )
+
+    guidance_lines.extend(
+        [
+            "- Favour iterating over known grid dimensions; avoid `while True` or open-ended recursion.",
+            "- Break out of loops once the required pattern is found to conserve time.",
+        ]
+    )
+
+    return "\n".join(guidance_lines)

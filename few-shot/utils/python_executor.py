@@ -7,6 +7,7 @@ import importlib
 import io
 import multiprocessing
 import queue
+import signal
 import traceback
 from contextlib import redirect_stderr, redirect_stdout
 from dataclasses import dataclass
@@ -98,6 +99,38 @@ class SolverResult:
     message: Optional[str] = None
     stdout: str = ""
     stderr: str = ""
+    exit_code: Optional[int] = None
+
+
+def _describe_signal_exit(exit_code: int) -> Optional[Tuple[str, str]]:
+    """Map a negative exit code to a structured error description."""
+
+    if exit_code >= 0:
+        return None
+
+    signal_number = -exit_code
+
+    try:
+        signal_name = signal.Signals(signal_number).name
+    except (ValueError, AttributeError):  # pragma: no cover - platform dependent
+        signal_name = f"SIG{signal_number}"
+
+    if getattr(signal, "SIGXCPU", None) is not None and signal_number == signal.SIGXCPU:
+        return (
+            "CpuLimitExceeded",
+            "Solver exceeded the CPU time limit and was terminated (SIGXCPU).",
+        )
+
+    if getattr(signal, "SIGKILL", None) is not None and signal_number == signal.SIGKILL:
+        return (
+            "Killed",
+            "Solver was killed by the operating system (SIGKILL).",
+        )
+
+    return (
+        "SignalExit",
+        f"Solver terminated due to signal {signal_name} ({signal_number}).",
+    )
 
 
 def extract_solver_code(response: str) -> str:
@@ -254,6 +287,7 @@ def run_solver(
             success=False,
             error_type="EmptySource",
             message="No source code provided for execution.",
+            exit_code=0,
         )
 
     if "def solve" not in code_str:
@@ -261,6 +295,7 @@ def run_solver(
             success=False,
             error_type="MissingEntryPoint",
             message="Generated code does not define a solve() function.",
+            exit_code=0,
         )
 
     serialized_examples = _serialize_examples(train_examples)
@@ -286,6 +321,7 @@ def run_solver(
                 success=False,
                 error_type="Timeout",
                 message=f"Execution timed out after {timeout} seconds.",
+                exit_code=None,
             )
         exit_code = process.exitcode
     finally:
@@ -311,16 +347,26 @@ def run_solver(
         if exit_code is None:
             exit_code = process.exitcode
         if exit_code not in (0, None):
+            signal_diagnosis = _describe_signal_exit(exit_code)
+            if signal_diagnosis is not None:
+                error_type, message = signal_diagnosis
+            else:
+                error_type = "ProcessExit"
+                message = (
+                    f"Solver exited with status {exit_code} without reporting a result."
+                )
             return SolverResult(
                 success=False,
-                error_type="ProcessExit",
-                message=f"Solver exited with status {exit_code} without reporting a result.",
+                error_type=error_type,
+                message=message,
+                exit_code=exit_code,
             )
 
         return SolverResult(
             success=False,
             error_type="NoResult",
             message="Solver process exited without returning a result.",
+            exit_code=exit_code,
         )
 
     if payload.get("status") == "ok":
@@ -330,6 +376,7 @@ def run_solver(
             output=output_array,
             stdout=payload.get("stdout", ""),
             stderr=payload.get("stderr", ""),
+            exit_code=0,
         )
 
     return SolverResult(
@@ -338,6 +385,7 @@ def run_solver(
         message=payload.get("message"),
         stdout=payload.get("stdout", ""),
         stderr=payload.get("stderr", ""),
+        exit_code=exit_code,
     )
 
 

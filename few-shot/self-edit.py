@@ -227,6 +227,25 @@ def score_grid_prediction(
     return reward, correct_cells, total_cells, adjustment_reason, normalized_array
 
 
+_SUSPICIOUS_LOOP_PATTERNS: List[Tuple[re.Pattern[str], str]] = [
+    (re.compile(r"\bwhile\s+True\b"), "an unconditional `while True` loop"),
+    (re.compile(r"\bwhile\s+1\b"), "an unconditional `while 1` loop"),
+    (
+        re.compile(r"itertools\s*\.\s*count\s*\("),
+        "`itertools.count` which produces an infinite iterator",
+    ),
+]
+
+
+def detect_unbounded_control_flow(code: str) -> Optional[str]:
+    """Return a human-readable reason if ``code`` contains obvious infinite loops."""
+
+    for pattern, description in _SUSPICIOUS_LOOP_PATTERNS:
+        if pattern.search(code):
+            return description
+    return None
+
+
 def get_augmenters(
     include_basic: bool = True,
     include_size: bool = True,
@@ -581,6 +600,9 @@ def main(
     n_tasks,
     n_self_edits_per_task,
     code_mode: bool = False,
+    solver_timeout: float = 5.0,
+    solver_cpu_time_limit: Optional[float] = 5.0,
+    solver_memory_limit_mb: Optional[int] = 512,
     vllm_dtype: str = "float16",
     vllm_max_model_len: int = 4096,
     vllm_max_num_batched_tokens: int = 4096,
@@ -620,9 +642,28 @@ def main(
 
         representer = GPTTextMessageRepresenterV2(task_representer=standard_formatter)
 
+    solver_timeout = max(float(solver_timeout), 0.1)
+    if solver_cpu_time_limit is None:
+        solver_cpu_time_limit_s: Optional[int] = None
+    elif solver_cpu_time_limit <= 0:
+        solver_cpu_time_limit_s = None
+    else:
+        solver_cpu_time_limit_s = max(int(round(solver_cpu_time_limit)), 1)
+
+    if solver_memory_limit_mb is None or solver_memory_limit_mb <= 0:
+        solver_memory_limit_value: Optional[int] = None
+    else:
+        solver_memory_limit_value = int(solver_memory_limit_mb)
+
+    execution_limits_payload = {
+        "timeout": solver_timeout,
+        "cpu_time_limit": solver_cpu_time_limit_s,
+        "memory_limit_mb": solver_memory_limit_value,
+    }
+
     # Load tasks
     tasks = read_tasks_from_single_file(
-        challenge_file=challenge_file, 
+        challenge_file=challenge_file,
         solution_file=solution_file
     )
 
@@ -695,7 +736,9 @@ def main(
                         f"(method={size_metadata.get('method') if size_metadata else 'unknown'})",
                     )
                 prompt_messages, _ = representer.encode(
-                    task, size_inference=(size_hint, size_metadata)
+                    task,
+                    size_inference=(size_hint, size_metadata),
+                    execution_limits=execution_limits_payload,
                 )
                 prompt_text = tokenizer.apply_chat_template(
                     prompt_messages,
@@ -823,6 +866,10 @@ def main(
                         "message": None,
                         "stdout": "",
                         "stderr": "",
+                        "exit_code": None,
+                        "timeout_s": solver_timeout,
+                        "cpu_time_limit_s": solver_cpu_time_limit_s,
+                        "memory_limit_mb": solver_memory_limit_value,
                     }
 
                     reward = 0.0
@@ -833,12 +880,20 @@ def main(
                     total_cells = None
                     reward_reason = None
                     normalized_output = None
+                    rejection_reason = None
+                    exec_result = None
 
                     if code:
+                        rejection_reason = detect_unbounded_control_flow(code)
+
+                    if code and rejection_reason is None:
                         exec_result = run_solver(
                             code,
                             train_examples=task.train_examples,
                             test_input=task.test_example.input,
+                            timeout=solver_timeout,
+                            memory_limit_mb=solver_memory_limit_value,
+                            cpu_time_limit_s=solver_cpu_time_limit_s,
                         )
                         execution_payload.update(
                             {
@@ -849,6 +904,9 @@ def main(
                                 "stderr": exec_result.stderr,
                             }
                         )
+                        if exec_result.exit_code is not None:
+                            execution_payload["exit_code"] = exec_result.exit_code
+
                         if exec_result.output is not None:
                             predicted_array = exec_result.output
                             predicted_output = (
@@ -887,9 +945,21 @@ def main(
                                     success = True
                                 reward_reason = "missing_prediction"
                             else:
-                                reward_reason = (
+                                reward_reason = reward_reason or (
                                     exec_result.error_type or "execution_failed"
                                 )
+                    elif code and rejection_reason is not None:
+                        reward_reason = "rejected_unbounded_loop"
+                        execution_payload.update(
+                            {
+                                "error_type": "RejectedPattern",
+                                "message": (
+                                    "Skipped execution because the program contains "
+                                    f"{rejection_reason}."
+                                ),
+                                "rejection_reason": rejection_reason,
+                            }
+                        )
                     else:
                         execution_payload.update(
                             {
@@ -933,6 +1003,8 @@ def main(
                         attempt_entry["correct_cells"] = correct_cells
                     if total_cells is not None:
                         attempt_entry["total_cells"] = total_cells
+                    if rejection_reason is not None:
+                        attempt_entry["rejection_reason"] = rejection_reason
                     if reward_reason is not None:
                         attempt_entry["grid_evaluation_reason"] = reward_reason
                         execution_payload["grid_evaluation_reason"] = reward_reason
@@ -1210,6 +1282,16 @@ if __name__ == "__main__":
                       help='Number of self-edits per task')
     parser.add_argument('--code_mode', action='store_true',
                       help='Format prompts for Python solver generation instead of grid outputs')
+    parser.add_argument('--solver_timeout', type=float, default=5.0,
+                      help='Wall-clock timeout (in seconds) for executing generated programs.')
+    parser.add_argument('--solver_cpu_time_limit', type=float, default=5.0,
+                      help='CPU time limit in seconds before the sandbox sends SIGXCPU.')
+    parser.add_argument('--solver_memory_limit_mb', type=int, default=512,
+                      help='Approximate memory limit in MiB for solver subprocesses.')
+    parser.add_argument('--solver_disable_cpu_limit', action='store_true',
+                      help='Disable the CPU time RLIMIT for sandboxed solver execution.')
+    parser.add_argument('--solver_disable_memory_limit', action='store_true',
+                      help='Disable the memory RLIMIT for sandboxed solver execution.')
     parser.add_argument('--vllm_dtype', type=str, default='float16', choices=['auto', 'float16', 'bfloat16'],
                       help='Precision to use for vLLM weights (default: float16 for lower memory use).')
     parser.add_argument('--vllm_max_model_len', type=int, default=4096,
@@ -1228,6 +1310,11 @@ if __name__ == "__main__":
 
     args = parser.parse_args()
 
+    solver_cpu_time_limit = None if args.solver_disable_cpu_limit else args.solver_cpu_time_limit
+    solver_memory_limit_mb = (
+        None if args.solver_disable_memory_limit else args.solver_memory_limit_mb
+    )
+
     main(
         experiment_name=args.experiment_name,
         skip_repeated_configs=args.skip_repeated_configs,
@@ -1237,6 +1324,9 @@ if __name__ == "__main__":
         n_tasks=args.n_tasks,
         n_self_edits_per_task=args.n_self_edits_per_task,
         code_mode=args.code_mode,
+        solver_timeout=args.solver_timeout,
+        solver_cpu_time_limit=solver_cpu_time_limit,
+        solver_memory_limit_mb=solver_memory_limit_mb,
         vllm_dtype=args.vllm_dtype,
         vllm_max_model_len=args.vllm_max_model_len,
         vllm_max_num_batched_tokens=args.vllm_max_num_batched_tokens,
