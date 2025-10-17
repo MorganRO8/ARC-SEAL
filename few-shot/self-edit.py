@@ -734,6 +734,8 @@ def main(
                     reward = 0.0
                     success = False
                     predicted_output = None
+                    correct_cells = None
+                    total_cells = None
 
                     if code:
                         exec_result = run_solver(
@@ -751,13 +753,22 @@ def main(
                             }
                         )
                         if exec_result.success and exec_result.output is not None:
-                            predicted_output = exec_result.output.tolist()
+                            predicted_array = exec_result.output
+                            predicted_output = predicted_array.tolist()
                             execution_payload["output"] = predicted_output
-                            if expected_output is not None and np.array_equal(
-                                exec_result.output, expected_output
-                            ):
+
+                            if expected_output is not None:
+                                if predicted_array.shape == expected_output.shape:
+                                    matches = predicted_array == expected_output
+                                    total_cells = int(matches.size)
+                                    correct_cells = int(matches.sum())
+                                    if total_cells > 0:
+                                        reward = correct_cells / total_cells
+                                    success = correct_cells == total_cells
+                                else:
+                                    reward = 0.0
+                            elif exec_result.success:
                                 success = True
-                                reward = 1.0
                     else:
                         execution_payload.update(
                             {
@@ -788,8 +799,12 @@ def main(
                         attempt_entry["predicted_output"] = predicted_output
                     if expected_output is not None:
                         attempt_entry["target_output"] = expected_output.tolist()
+                    if correct_cells is not None:
+                        attempt_entry["correct_cells"] = correct_cells
+                    if total_cells is not None:
+                        attempt_entry["total_cells"] = total_cells
 
-                    if success and code:
+                    if reward > 0 and code:
                         chat_text = tokenizer.apply_chat_template(
                             chat_messages,
                             tokenize=False,
@@ -812,8 +827,14 @@ def main(
                         attempt_entry["tokenized"] = None
 
                     task_configs[base_task_name].append(attempt_entry)
+                    reward_str = f"{reward:.3f}" if isinstance(reward, (int, float)) else reward
+                    if correct_cells is not None and total_cells is not None:
+                        progress_str = f" ({correct_cells}/{total_cells} cells)"
+                    else:
+                        progress_str = ""
                     print(
-                        f"New program for task {base_task_name}: success={success}, reward={reward}"
+                        f"New program for task {base_task_name}: success={success}, "
+                        f"reward={reward_str}{progress_str}"
                     )
                     continue
 
@@ -889,11 +910,13 @@ def main(
             positive_attempts = [
                 attempt
                 for attempt in configs
-                if attempt.get("success") and attempt.get("tokenized") is not None
+                if attempt.get("reward", 0) > 0 and attempt.get("tokenized") is not None
             ]
 
             if not positive_attempts:
-                print(f"No successful programs for {base_task_name}; skipping fine-tuning.")
+                print(
+                    f"No rewarded programs for {base_task_name}; skipping fine-tuning."
+                )
                 final_configs_and_indices[base_task_name] = {}
                 continue
 
@@ -927,6 +950,10 @@ def main(
                     attempt_summary["predicted_output"] = attempt["predicted_output"]
                 if "target_output" in attempt:
                     attempt_summary["target_output"] = attempt["target_output"]
+                if "correct_cells" in attempt:
+                    attempt_summary["correct_cells"] = attempt["correct_cells"]
+                if "total_cells" in attempt:
+                    attempt_summary["total_cells"] = attempt["total_cells"]
                 if attempt.get("total_tokens") is not None:
                     attempt_summary["total_tokens"] = attempt["total_tokens"]
                 sanitized_attempts.append(attempt_summary)
