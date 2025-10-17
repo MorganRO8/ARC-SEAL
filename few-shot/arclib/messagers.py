@@ -149,6 +149,7 @@ def _summarize_task_grid_dimensions(
 
 
 def _format_size_guidance(
+    task: Task,
     inferred_shape: Optional[Tuple[int, int]],
     inference_details: Optional[Dict[str, object]],
 ) -> str:
@@ -157,27 +158,110 @@ def _format_size_guidance(
 
     explanation = inference_details.get("explanation")
     method = inference_details.get("method")
+    evidence = inference_details.get("evidence") or {}
+
+    def _dims(shape: Optional[Tuple[int, int]]) -> Optional[str]:
+        if shape is None:
+            return None
+        return f"{int(shape[0])}×{int(shape[1])}"
+
+    def _shape_of(array) -> Optional[Tuple[int, int]]:
+        try:
+            values = np.asarray(array)
+        except Exception:
+            return None
+        if values.ndim < 2:
+            return None
+        rows, cols = values.shape[:2]
+        try:
+            return int(rows), int(cols)
+        except (TypeError, ValueError):
+            return None
+
+    test_input_shape = _shape_of(task.test_example.input)
+
+    def _format_param(value: Optional[float]) -> str:
+        if value is None:
+            return "?"
+        if isinstance(value, (int, np.integer)):
+            return str(int(value))
+        if isinstance(value, float) and abs(value - round(value)) < 1e-9:
+            return str(int(round(value)))
+        return str(value)
 
     if inferred_shape is None:
         if explanation:
             return explanation
         return (
-            "No automatic output-size heuristic matched this task. Use the training"
-            " examples to deduce the correct dimensions."
+            "No automatic output-size heuristic matched this task. Use the training examples"
+            " to deduce the correct output dimensions and implement them explicitly."
         )
 
-    rows, cols = inferred_shape
+    size_text = _dims(inferred_shape)
     method_display = method.replace("_", " ") if isinstance(method, str) else "heuristic"
 
-    header = (
-        f"The pipeline inferred an output grid of {int(rows)}×{int(cols)} "
-        f"using the {method_display} rule."
-    )
+    summary_parts: List[str] = [
+        f"The expected test output grid size is {size_text} based on the {method_display} rule."
+    ]
+
+    if method == "constant_match":
+        test_dims = _dims(test_input_shape)
+        if test_dims:
+            summary_parts.append(
+                "All training inputs and outputs share these dimensions, and the test input"
+                f" already has size {test_dims}. Treat this as an identity size rule."
+            )
+        else:
+            summary_parts.append(
+                "All training inputs and outputs share these dimensions. Treat the test case as"
+                " using the same size."
+            )
+    elif method == "arithmetic_addition":
+        row_param = evidence.get("row_param")
+        col_param = evidence.get("col_param")
+        if row_param == 0 and col_param == 0:
+            summary_parts.append(
+                "Training pairs show that outputs always match their corresponding inputs, so"
+                " keep the test output the same size as its input."
+            )
+        else:
+            summary_parts.append(
+                "Training pairs change the grid size by adding"
+                f" {_format_param(row_param)} rows and {_format_param(col_param)} columns. Apply the same adjustment to the"
+                " test input before producing the result."
+            )
+    elif method and method.startswith("arithmetic_"):
+        op = method.split("_", 1)[1]
+        row_param = evidence.get("row_param")
+        col_param = evidence.get("col_param")
+        summary_parts.append(
+            "Training grids map inputs to outputs via {op} by {row_param} on rows and"
+            " {col_param} on columns; use that rule for the test grid.".format(
+                op=op,
+                row_param=_format_param(row_param),
+                col_param=_format_param(col_param),
+            )
+        )
 
     if explanation:
-        return f"{header}\n{explanation}"
+        summary_parts.append(explanation)
 
-    return header
+    if test_input_shape is not None:
+        if inferred_shape == test_input_shape:
+            summary_parts.append(
+                "Ensure your solver always returns grids with the same dimensions as the test input."
+            )
+        else:
+            summary_parts.append(
+                "The test input is {_dims(test_input_shape)}; make sure your code constructs a"
+                f" {size_text} grid even when intermediate computations use other shapes."
+            )
+    else:
+        summary_parts.append(
+            f"Ensure your solver always returns a {size_text} grid."
+        )
+
+    return " ".join(part.strip() for part in summary_parts if part)
 
 
 def display_messages(messages: MESSAGES):
@@ -481,7 +565,7 @@ class PythonSolverMessageRepresenter(MessageRepresenter):
         test_example_text = _format_test_example_for_prompt(task.test_example)
 
         grid_stats = _summarize_task_grid_dimensions(task, inferred_shape)
-        size_guidance = _format_size_guidance(inferred_shape, inference_details)
+        size_guidance = _format_size_guidance(task, inferred_shape, inference_details)
 
         helper_overview = kwargs.get("helper_overview")
         helper_api_reference = kwargs.get("helper_api_reference")

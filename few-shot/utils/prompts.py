@@ -76,29 +76,30 @@ python_solver_function_docstring = dedent(
 
 python_solver_user_template = dedent(
     """
-    {description}Training examples (inputs and outputs shown as grids with space-separated values):
+    {description}Training examples:
     {train_examples}
 
-    Grid dimension summary (rows × cols):
+    Test input grid:
+    {test_example}
+
+    Determine the general transformation that maps each training input to its output and implement it in Python.
+    The same code must reproduce all training outputs before returning the solution for the test grid.
+    During inference we discard any program that fails a training pair, so ensure your solver handles every example.
+
+    Grid notes:
     {grid_stats}
 
-    Output grid size guidance:
+    Output size reasoning:
     {size_guidance}
 
     {helper_section}
 
-    Execution constraints and runtime guidance:
+    Execution constraints:
     {runtime_guidance}
 
-    Getting the output grid dimensions correct is critical—predictions with the wrong height or width
-    are treated as incorrect regardless of their contents.
+    Getting the output grid dimensions correct is critical—predictions with the wrong height or width are treated as incorrect regardless of their contents.
 
-    Test example grids:
-    {test_example}
-
-    Implement the function below. Include the provided docstring exactly as the first statement of the
-    function and limit your response to executable Python. Helper functions are allowed, but the entry
-    point must match the signature.
+    Implement the function below. Include the provided docstring exactly as the first statement of the function and limit your response to executable Python. Helper functions are allowed, but the entry point must match the signature.
 
     Signature: {function_signature}
     Docstring text:
