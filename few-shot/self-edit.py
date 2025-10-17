@@ -5,7 +5,7 @@ import glob
 import numpy as np
 import torch
 from tqdm.auto import tqdm
-from typing import List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple
 from datetime import datetime
 from collections import Counter
 from transformers import AutoTokenizer, AutoModelForCausalLM
@@ -75,6 +75,7 @@ from arclib.messagers import MessageRepresenter
 from vllm import LLM, SamplingParams
 
 from utils.prompts import self_edit_prompt, system_message
+from utils.output_size_inference import infer_output_shape
 from utils.python_executor import extract_solver_code, run_solver
 
 
@@ -146,44 +147,84 @@ class NumpyEncoder(json.JSONEncoder):
         return super(NumpyEncoder, self).default(obj)
 
 
+def _pad_or_crop_to_shape(
+    array: np.ndarray, target_shape: Tuple[int, int]
+) -> np.ndarray:
+    """Pad or crop ``array`` to match ``target_shape`` using the mode color."""
+
+    target_rows, target_cols = target_shape
+    if array.size == 0:
+        fill_value = 0
+    else:
+        flat = array.flatten()
+        try:
+            counts = np.bincount(flat)
+            fill_value = int(np.argmax(counts))
+        except ValueError:
+            fill_value = int(flat[0])
+
+    result = np.full((target_rows, target_cols), fill_value, dtype=array.dtype)
+    rows = min(array.shape[0], target_rows)
+    cols = min(array.shape[1], target_cols)
+    result[:rows, :cols] = array[:rows, :cols]
+    return result
+
+
 def score_grid_prediction(
     predicted_output: Optional[np.ndarray],
     expected_output: Optional[np.ndarray],
-) -> Tuple[float, Optional[int], Optional[int], Optional[str]]:
+    *,
+    shape_hint: Optional[Tuple[int, int]] = None,
+) -> Tuple[float, Optional[int], Optional[int], Optional[str], Optional[np.ndarray]]:
     """Compute partial-credit reward for a predicted grid.
 
-    Returns a tuple of ``(reward, correct_cells, total_cells, reason)`` where
-    ``reason`` is ``None`` when a comparison was possible and a short string
-    describing why no reward was awarded otherwise.
+    Returns ``(reward, correct_cells, total_cells, reason, normalized_output)``.
+    ``normalized_output`` is the grid actually compared against the target after
+    any padding/cropping. ``reason`` is ``None`` when a comparison succeeded.
     """
 
     if expected_output is None:
-        return 0.0, None, None, "missing_target"
+        return 0.0, None, None, "missing_target", None
     if predicted_output is None:
-        return 0.0, None, None, "missing_prediction"
+        return 0.0, None, None, "missing_prediction", None
 
     try:
         predicted_array = np.asarray(predicted_output, dtype=int)
     except (TypeError, ValueError):
-        return 0.0, None, None, "non_integer_prediction"
+        return 0.0, None, None, "non_integer_prediction", None
 
     try:
         expected_array = np.asarray(expected_output, dtype=int)
     except (TypeError, ValueError):
-        return 0.0, None, None, "invalid_target"
+        return 0.0, None, None, "invalid_target", None
 
-    if predicted_array.shape != expected_array.shape:
-        return 0.0, 0, int(expected_array.size), "shape_mismatch"
+    target_shape = expected_array.shape
+    normalized_array = predicted_array
+    adjustment_reason: Optional[str] = None
+
+    if predicted_array.shape != target_shape:
+        if (
+            shape_hint is not None
+            and len(target_shape) >= 2
+            and (int(target_shape[0]), int(target_shape[1])) == tuple(shape_hint)
+        ):
+            normalized_array = _pad_or_crop_to_shape(predicted_array, tuple(shape_hint))
+            adjustment_reason = (
+                "shape_adjusted "
+                f"{predicted_array.shape[:2]}->{tuple(shape_hint)}"
+            )
+        else:
+            return 0.0, 0, int(expected_array.size), "shape_mismatch", predicted_array
 
     total_cells = int(expected_array.size)
     if total_cells == 0:
-        return 0.0, 0, 0, "empty_target"
+        return 0.0, 0, 0, "empty_target", normalized_array
 
-    matches = predicted_array == expected_array
+    matches = normalized_array == expected_array
     correct_cells = int(np.count_nonzero(matches))
     reward = float(correct_cells) / float(total_cells) if total_cells else 0.0
 
-    return reward, correct_cells, total_cells, None
+    return reward, correct_cells, total_cells, adjustment_reason, normalized_array
 
 
 def get_augmenters(
@@ -643,8 +684,19 @@ def main(
 
             prompt_token_length = None
             available_context = None
+            size_hint: Optional[Tuple[int, int]] = None
+            size_metadata: Optional[Dict[str, object]] = None
             if code_mode:
-                prompt_messages, _ = representer.encode(task)
+                size_hint, size_metadata = infer_output_shape(task)
+                if size_hint is not None:
+                    print(
+                        "Inferred output size for",
+                        f"{base_task_name}: {size_hint[0]}×{size_hint[1]}",
+                        f"(method={size_metadata.get('method') if size_metadata else 'unknown'})",
+                    )
+                prompt_messages, _ = representer.encode(
+                    task, size_inference=(size_hint, size_metadata)
+                )
                 prompt_text = tokenizer.apply_chat_template(
                     prompt_messages,
                     tokenize=False,
@@ -708,6 +760,8 @@ def main(
                         continue
             else:
                 prompt_text = get_prompt(task, system_message, self_edit_prompt)
+                size_hint = None
+                size_metadata = None
 
             # Initialize config/program tracking for this task
             if base_task_name not in explored_configs:
@@ -778,6 +832,7 @@ def main(
                     correct_cells = None
                     total_cells = None
                     reward_reason = None
+                    normalized_output = None
 
                     if code:
                         exec_result = run_solver(
@@ -796,7 +851,11 @@ def main(
                         )
                         if exec_result.output is not None:
                             predicted_array = exec_result.output
-                            predicted_output = predicted_array.tolist()
+                            predicted_output = (
+                                predicted_array.tolist()
+                                if isinstance(predicted_array, np.ndarray)
+                                else predicted_array
+                            )
                             execution_payload["output"] = predicted_output
 
                             (
@@ -804,7 +863,19 @@ def main(
                                 correct_cells,
                                 total_cells,
                                 reward_reason,
-                            ) = score_grid_prediction(predicted_array, expected_output)
+                                normalized_array,
+                            ) = score_grid_prediction(
+                                predicted_array,
+                                expected_output,
+                                shape_hint=size_hint,
+                            )
+
+                            if normalized_array is not None:
+                                if isinstance(normalized_array, np.ndarray):
+                                    normalized_output = normalized_array.tolist()
+                                else:
+                                    normalized_output = np.asarray(normalized_array).tolist()
+                                execution_payload["normalized_output"] = normalized_output
 
                             if expected_output is None:
                                 success = exec_result.success
@@ -847,8 +918,17 @@ def main(
 
                     if predicted_output is not None:
                         attempt_entry["predicted_output"] = predicted_output
+                    if normalized_output is not None:
+                        attempt_entry["normalized_output"] = normalized_output
                     if expected_output is not None:
                         attempt_entry["target_output"] = expected_output.tolist()
+                    if size_hint is not None:
+                        attempt_entry["output_size_hint"] = [
+                            int(size_hint[0]),
+                            int(size_hint[1]),
+                        ]
+                    if size_metadata is not None:
+                        attempt_entry["output_size_inference"] = size_metadata
                     if correct_cells is not None:
                         attempt_entry["correct_cells"] = correct_cells
                     if total_cells is not None:
@@ -885,15 +965,16 @@ def main(
                         progress_str = f" ({correct_cells}/{total_cells} cells)"
                     else:
                         progress_str = ""
-                    if reward_reason and reward == 0.0:
+                    if reward_reason:
                         detail = reward_reason
-                        if (
-                            reward_reason == "shape_mismatch"
-                            and predicted_array is not None
-                            and expected_output is not None
-                        ):
+                        if reward_reason == "shape_mismatch" and expected_output is not None:
+                            try:
+                                predicted_shape = tuple(np.asarray(predicted_array).shape)
+                            except Exception:
+                                predicted_shape = "unknown"
                             detail = (
-                                f"shape_mismatch {predicted_array.shape}!= {expected_output.shape}"
+                                "shape_mismatch "
+                                f"{predicted_shape}!={expected_output.shape}"
                             )
                         progress_str = (
                             f"{progress_str} [{detail}]" if progress_str else f"[{detail}]"

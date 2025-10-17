@@ -78,6 +78,9 @@ python_solver_user_template = dedent(
     Grid dimension summary (rows × cols):
     {grid_stats}
 
+    Output grid size guidance:
+    {size_guidance}
+
     Getting the output grid dimensions correct is critical—predictions with the wrong height or width
     are treated as incorrect regardless of their contents.
 

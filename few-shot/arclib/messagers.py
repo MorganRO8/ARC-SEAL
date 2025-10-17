@@ -32,6 +32,8 @@ from utils.prompts import (
     python_solver_user_template,
 )
 
+from utils.output_size_inference import infer_output_shape
+
 
 MESSAGE = Dict[str, Union[str, Dict]]
 MESSAGES = List[MESSAGE]
@@ -63,7 +65,9 @@ def _format_grid_dimensions(grid) -> Optional[str]:
     return f"{rows_int}×{cols_int}"
 
 
-def _summarize_task_grid_dimensions(task: Task) -> str:
+def _summarize_task_grid_dimensions(
+    task: Task, inferred_shape: Optional[Tuple[int, int]] = None
+) -> str:
     """Build a bullet-list summary of train/test grid dimensions for a task."""
 
     lines: List[str] = []
@@ -88,10 +92,48 @@ def _summarize_task_grid_dimensions(task: Task) -> str:
         if test_output_dims:
             lines.append(f"Test expected output: {test_output_dims}")
 
+    if inferred_shape is not None:
+        lines.append(
+            "Inferred output size guidance: "
+            f"{int(inferred_shape[0])}×{int(inferred_shape[1])}"
+        )
+
     if not lines:
         return "(no grid dimension metadata available)"
 
     return "\n".join(f"- {line}" for line in lines)
+
+
+def _format_size_guidance(
+    inferred_shape: Optional[Tuple[int, int]],
+    inference_details: Optional[Dict[str, object]],
+) -> str:
+    if inference_details is None:
+        inference_details = {}
+
+    explanation = inference_details.get("explanation")
+    method = inference_details.get("method")
+
+    if inferred_shape is None:
+        if explanation:
+            return explanation
+        return (
+            "No automatic output-size heuristic matched this task. Use the training"
+            " examples to deduce the correct dimensions."
+        )
+
+    rows, cols = inferred_shape
+    method_display = method.replace("_", " ") if isinstance(method, str) else "heuristic"
+
+    header = (
+        f"The pipeline inferred an output grid of {int(rows)}×{int(cols)} "
+        f"using the {method_display} rule."
+    )
+
+    if explanation:
+        return f"{header}\n{explanation}"
+
+    return header
 
 
 def display_messages(messages: MESSAGES):
@@ -374,6 +416,12 @@ class PythonSolverMessageRepresenter(MessageRepresenter):
         self.response_stub = response_stub
 
     def encode(self, task: Task, **kwargs) -> Tuple[MESSAGES, MESSAGE]:
+        size_inference = kwargs.get("size_inference")
+        if size_inference is None:
+            inferred_shape, inference_details = infer_output_shape(task)
+        else:
+            inferred_shape, inference_details = size_inference
+
         description = ""
         if getattr(task, "description", None):
             description = f"Task description:\n{task.description.strip()}\n\n"
@@ -387,7 +435,8 @@ class PythonSolverMessageRepresenter(MessageRepresenter):
         if getattr(task.test_example, "output", None) is not None:
             test_payload["output"] = task.test_example.output.tolist()
 
-        grid_stats = _summarize_task_grid_dimensions(task)
+        grid_stats = _summarize_task_grid_dimensions(task, inferred_shape)
+        size_guidance = _format_size_guidance(inferred_shape, inference_details)
 
         user_content = self.user_prompt_template.format(
             description=description,
@@ -396,6 +445,7 @@ class PythonSolverMessageRepresenter(MessageRepresenter):
             function_signature=self.function_signature,
             function_docstring=self.function_docstring,
             grid_stats=grid_stats,
+            size_guidance=size_guidance,
         )
 
         input_messages = [
