@@ -1,10 +1,9 @@
 """
 This module contains classes for representing tasks and examples as messages for chat-based interfaces.
 """
-import json
 from abc import ABC, abstractmethod
 from html import escape
-from typing import Dict, List, Optional, Tuple, Union
+from typing import Dict, List, Optional, Sequence, Tuple, Union
 
 import numpy as np
 
@@ -38,6 +37,50 @@ from utils.output_size_inference import infer_output_shape
 
 MESSAGE = Dict[str, Union[str, Dict]]
 MESSAGES = List[MESSAGE]
+
+
+def _grid_to_string(grid: Sequence[Sequence[int]]) -> str:
+    """Convert a 2D grid into a space-separated string representation."""
+
+    if not grid:
+        return "(empty grid)"
+
+    rows = []
+    for row in grid:
+        if not row:
+            rows.append("(empty row)")
+            continue
+        rows.append(" ".join(str(int(cell)) for cell in row))
+    return "\n".join(rows)
+
+
+def _format_train_examples_for_prompt(examples: Sequence[Example]) -> str:
+    """Render training examples for inclusion in the Python solver prompt."""
+
+    if not examples:
+        return "No training examples were provided for this task."
+
+    blocks: List[str] = []
+    for idx, example in enumerate(examples, start=1):
+        input_grid = _grid_to_string(example.input.tolist())
+        output_grid = _grid_to_string(example.output.tolist())
+        blocks.append(
+            f"Input {idx}:\n{input_grid}\n\nOutput:\n{output_grid}"
+        )
+    return "\n\n".join(blocks)
+
+
+def _format_test_example_for_prompt(example: Example) -> str:
+    """Render the test example grid(s) for the Python solver prompt."""
+
+    parts = [f"Test input:\n{_grid_to_string(example.input.tolist())}"]
+
+    if getattr(example, "output", None) is not None:
+        parts.append(
+            "Expected output:\n" + _grid_to_string(example.output.tolist())
+        )
+
+    return "\n\n".join(parts)
 
 
 def _format_grid_dimensions(grid) -> Optional[str]:
@@ -434,14 +477,8 @@ class PythonSolverMessageRepresenter(MessageRepresenter):
         if getattr(task, "description", None):
             description = f"Task description:\n{task.description.strip()}\n\n"
 
-        train_examples = [
-            {"input": example.input.tolist(), "output": example.output.tolist()}
-            for example in task.train_examples
-        ]
-
-        test_payload = {"input": task.test_example.input.tolist()}
-        if getattr(task.test_example, "output", None) is not None:
-            test_payload["output"] = task.test_example.output.tolist()
+        train_examples_text = _format_train_examples_for_prompt(task.train_examples)
+        test_example_text = _format_test_example_for_prompt(task.test_example)
 
         grid_stats = _summarize_task_grid_dimensions(task, inferred_shape)
         size_guidance = _format_size_guidance(inferred_shape, inference_details)
@@ -473,8 +510,8 @@ class PythonSolverMessageRepresenter(MessageRepresenter):
 
         user_content = self.user_prompt_template.format(
             description=description,
-            train_examples=json.dumps(train_examples, indent=4),
-            test_example=json.dumps(test_payload, indent=4),
+            train_examples=train_examples_text,
+            test_example=test_example_text,
             function_signature=self.function_signature,
             function_docstring=self.function_docstring,
             grid_stats=grid_stats,

@@ -76,7 +76,7 @@ python_solver_function_docstring = dedent(
 
 python_solver_user_template = dedent(
     """
-    {description}Training examples (Python dictionaries with \"input\" and \"output\" grids):
+    {description}Training examples (inputs and outputs shown as grids with space-separated values):
     {train_examples}
 
     Grid dimension summary (rows × cols):
@@ -93,7 +93,7 @@ python_solver_user_template = dedent(
     Getting the output grid dimensions correct is critical—predictions with the wrong height or width
     are treated as incorrect regardless of their contents.
 
-    Test example data:
+    Test example grids:
     {test_example}
 
     Implement the function below. Include the provided docstring exactly as the first statement of the
