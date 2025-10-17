@@ -287,15 +287,27 @@ def run_solver(
         except AttributeError:
             pass
 
-    payload: Optional[dict]
+    payload: Optional[dict] = None
     try:
-        payload = result_queue.get_nowait()
+        payload = result_queue.get(timeout=0.5)
     except queue.Empty:
         payload = None
 
     result_queue.close()
+    try:
+        result_queue.join_thread()
+    except (AttributeError, ValueError):  # pragma: no cover - platform specific
+        pass
 
     if payload is None:
+        exit_code = process.exitcode
+        if exit_code not in (0, None):
+            return SolverResult(
+                success=False,
+                error_type="ProcessExit",
+                message=f"Solver exited with status {exit_code} without reporting a result.",
+            )
+
         return SolverResult(
             success=False,
             error_type="NoResult",
