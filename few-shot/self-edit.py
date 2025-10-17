@@ -601,6 +601,8 @@ def main(
                 progress_bar.update(1)
                 continue
 
+            prompt_token_length = None
+            available_context = None
             if code_mode:
                 prompt_messages, _ = representer.encode(task)
                 prompt_text = tokenizer.apply_chat_template(
@@ -608,6 +610,62 @@ def main(
                     tokenize=False,
                     add_generation_prompt=True,
                 )
+
+                try:
+                    prompt_tokens = tokenizer(
+                        prompt_text,
+                        return_tensors="pt",
+                        add_special_tokens=False,
+                    )
+                except ValueError as error:
+                    print(
+                        "Failed to tokenize prompt for task"
+                        f" {base_task_name}: {error}"
+                    )
+                    progress_bar.update(1)
+                    continue
+
+                prompt_token_length = int(prompt_tokens["input_ids"].shape[-1])
+                if vllm_max_model_len and vllm_max_model_len > 0:
+                    max_model_len = vllm_max_model_len
+                else:
+                    max_model_len = getattr(
+                        getattr(self_edit_model, "llm_engine", None),
+                        "max_model_len",
+                        None,
+                    )
+                    if max_model_len is None and getattr(
+                        getattr(self_edit_model, "llm_engine", None),
+                        "model_config",
+                        None,
+                    ) is not None:
+                        max_model_len = getattr(
+                            self_edit_model.llm_engine.model_config,
+                            "max_model_len",
+                            None,
+                        )
+
+                if max_model_len is not None:
+                    available_context = max_model_len - (
+                        sampling_params.max_tokens or 0
+                    )
+                    if available_context <= 0:
+                        print(
+                            "No room for prompt tokens with current generation "
+                            f"budget (max_model_len={max_model_len}, "
+                            f"max_tokens={sampling_params.max_tokens})."
+                        )
+                        progress_bar.update(1)
+                        continue
+
+                    if prompt_token_length > available_context:
+                        print(
+                            f"Skipping task {base_task_name}: prompt requires "
+                            f"{prompt_token_length} tokens but only "
+                            f"{available_context} are available."
+                        )
+                        progress_bar.update(1)
+                        continue
             else:
                 prompt_text = get_prompt(task, system_message, self_edit_prompt)
 
@@ -621,9 +679,31 @@ def main(
                 expected_output = np.array(task.test_example.output)
 
             while len(task_configs[base_task_name]) < n_self_edits_per_task:
-                response = self_edit_model.generate(
-                    prompt_text, sampling_params=sampling_params
-                )
+                try:
+                    response = self_edit_model.generate(
+                        prompt_text, sampling_params=sampling_params
+                    )
+                except ValueError as error:
+                    if "maximum model length" in str(error).lower():
+                        if prompt_token_length is None and code_mode:
+                            print(
+                                f"Skipping task {base_task_name} due to context "
+                                f"overflow: {error}"
+                            )
+                        elif prompt_token_length is not None and available_context is not None:
+                            print(
+                                f"Skipping task {base_task_name}: prompt requires "
+                                f"{prompt_token_length} tokens but only "
+                                f"{available_context} are available."
+                            )
+                        else:
+                            print(
+                                f"Skipping task {base_task_name} due to context "
+                                f"overflow: {error}"
+                            )
+                        break
+                    else:
+                        raise
                 output = response[0].outputs[0]
 
                 if code_mode:
