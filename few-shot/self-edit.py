@@ -5,10 +5,9 @@ import os
 import re
 import textwrap
 from collections import Counter
-import hashlib
 from copy import deepcopy
 from datetime import datetime
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 import torch
@@ -958,19 +957,17 @@ def main(
         representer = GPTTextMessageRepresenterV2(task_representer=standard_formatter)
 
     helper_library: Optional[HelperLibrary] = None
-    helper_prompt_overview: Optional[str] = None
-    helper_prompt_api: Optional[str] = None
-    helper_prompt_source: Optional[str] = None
+    helper_prompt_summary: Optional[str] = None
+    helper_prompt_groups: Optional[Sequence[str]] = None
     helper_namespace: str = "ARC_HELPERS"
     helper_source_digest: Optional[str] = None
 
     if code_mode and include_solver_helpers:
         helper_library = get_helper_library()
-        helper_prompt_overview = helper_library.prompt_overview
-        helper_prompt_api = helper_library.api_reference
-        helper_prompt_source = helper_library.source
+        helper_prompt_summary = helper_library.prompt_summary
+        helper_prompt_groups = helper_library.prompt_groups
         helper_namespace = helper_library.namespace
-        helper_source_digest = hashlib.sha256(helper_library.source.encode("utf-8")).hexdigest()
+        helper_source_digest = helper_library.source_digest
         print(
             "Including solver helper library under namespace",
             helper_namespace,
@@ -1086,9 +1083,8 @@ def main(
                     task,
                     size_inference=(size_hint, size_metadata),
                     execution_limits=execution_limits_payload,
-                    helper_overview=helper_prompt_overview,
-                    helper_api_reference=helper_prompt_api,
-                    helper_source=helper_prompt_source,
+                    helper_summary=helper_prompt_summary,
+                    helper_groups=helper_prompt_groups,
                     helper_namespace=helper_namespace,
                 )
                 base_prompt_messages = [deepcopy(message) for message in encoded_messages]
@@ -1516,10 +1512,10 @@ def main(
                     if helper_library is not None:
                         solver_helpers_entry.setdefault("namespace", helper_library.namespace)
                         solver_helpers_entry.setdefault("source_sha256", helper_source_digest)
-                        if helper_prompt_overview is not None:
-                            solver_helpers_entry.setdefault("prompt_overview", helper_prompt_overview)
-                        if helper_prompt_api is not None:
-                            solver_helpers_entry.setdefault("api_reference", helper_prompt_api)
+                        if helper_prompt_summary is not None:
+                            solver_helpers_entry.setdefault("prompt_summary", helper_prompt_summary)
+                        if helper_prompt_groups:
+                            solver_helpers_entry.setdefault("prompt_groups", list(helper_prompt_groups))
                     attempt_entry["solver_helpers"] = solver_helpers_entry
 
                     if local_predicted_output is not None:

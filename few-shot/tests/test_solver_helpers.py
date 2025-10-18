@@ -133,25 +133,25 @@ class SolverHelpersTests(unittest.TestCase):
             task,
             size_inference=((2, 2), {"method": "manual"}),
             execution_limits={},
-            helper_overview=helper_library.prompt_overview,
-            helper_api_reference=helper_library.api_reference,
-            helper_source=helper_library.source,
+            helper_summary=helper_library.prompt_summary,
+            helper_groups=helper_library.prompt_groups,
             helper_namespace=helper_library.namespace,
         )
         helper_prompt = messages_with_helpers[1]["content"]
         self.assertIn(helper_library.namespace, helper_prompt)
-        self.assertIn("Helper source code", helper_prompt)
+        self.assertIn("utility functions", helper_prompt.lower())
+        for group_text in helper_library.prompt_groups:
+            self.assertIn(group_text.splitlines()[0], helper_prompt)
 
         messages_without_helpers, _ = representer.encode(
             task,
             size_inference=((2, 2), {"method": "manual"}),
             execution_limits={},
-            helper_overview=None,
-            helper_api_reference=None,
-            helper_source=None,
+            helper_summary=None,
+            helper_groups=None,
         )
         no_helper_prompt = messages_without_helpers[1]["content"]
-        self.assertIn("No helper library is loaded", no_helper_prompt)
+        self.assertIn("No ARC utility functions", no_helper_prompt)
 
 
 if __name__ == "__main__":

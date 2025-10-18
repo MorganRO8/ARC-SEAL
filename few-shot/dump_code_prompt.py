@@ -72,9 +72,8 @@ def build_code_mode_prompt_for_task(
     if include_helpers:
         helper_library = get_helper_library()
         helper_kwargs = {
-            "helper_overview": helper_library.prompt_overview,
-            "helper_api_reference": helper_library.api_reference,
-            "helper_source": helper_library.source,
+            "helper_summary": helper_library.prompt_summary,
+            "helper_groups": helper_library.prompt_groups,
             "helper_namespace": helper_library.namespace,
         }
 
@@ -120,7 +119,7 @@ def _format_metadata_lines(result: PromptRenderResult, *, model_name: str) -> It
     yield f"Model: {model_name}"
     yield f"Task: {result.task.name or '(unnamed task)'}"
     yield f"Output size hint: {size_line}"
-    yield f"Helpers: {helper_status}{helper_namespace}"
+    yield f"Utility functions: {helper_status}{helper_namespace}"
 
     if result.size_metadata:
         method = result.size_metadata.get("method")

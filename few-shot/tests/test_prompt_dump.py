@@ -62,7 +62,7 @@ class PromptDumpTests(unittest.TestCase):
 
         result = build_code_mode_prompt_for_task(task, tokenizer)
 
-        self.assertIn("No helper library is loaded", result.prompt_text)
+        self.assertIn("No ARC utility functions", result.prompt_text)
         self.assertIsNone(result.helper_library)
 
     def test_prompt_with_helpers_mentions_namespace(self) -> None:
@@ -72,6 +72,7 @@ class PromptDumpTests(unittest.TestCase):
         result = build_code_mode_prompt_for_task(task, tokenizer, include_helpers=True)
 
         self.assertIn(HELPER_NAMESPACE, result.prompt_text)
+        self.assertIn("utility functions", result.prompt_text.lower())
         self.assertIsNotNone(result.helper_library)
 
 

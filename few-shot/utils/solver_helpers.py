@@ -9,12 +9,11 @@ inside the sandboxed execution environment.
 
 from __future__ import annotations
 
-import inspect
 from collections import deque
 from dataclasses import dataclass
+from hashlib import sha256
 from pathlib import Path
-from textwrap import dedent
-from typing import Iterable, Iterator, List, Mapping, Optional, Sequence, Tuple
+from typing import Iterator, List, Mapping, Optional, Sequence, Tuple
 
 Grid = Sequence[Sequence[int]]
 Point = Tuple[int, int]
@@ -324,40 +323,58 @@ class HelperLibrary:
 
     namespace: str
     functions: Mapping[str, object]
-    prompt_overview: str
-    api_reference: str
-    source: str
+    prompt_summary: str
+    prompt_groups: Sequence[str]
     module_filename: str
+    source_digest: str
 
 
-def _format_overview(functions: Mapping[str, object]) -> str:
-    lines: List[str] = []
-    for name in sorted(functions):
-        obj = functions[name]
-        if not callable(obj):
-            continue
-        doc = inspect.getdoc(obj) or ""
-        summary = doc.splitlines()[0] if doc else "Utility function."
-        lines.append(f"- {name}: {summary}")
-    return "\n".join(lines)
+PROMPT_GROUPS: Sequence[Tuple[str, Sequence[str]]] = (
+    (
+        "Grid analysis (call with a grid; returns dictionaries describing objects)",
+        (
+            "components = ARC_HELPERS.get_connected_components(grid, connectivity=4, color=None)"
+            " -> each dict has keys: color, cells, size, bbox",
+            "components = ARC_HELPERS.get_components_by_color(grid, color, connectivity=4)",
+            "components = ARC_HELPERS.components_by_size(grid, connectivity=4)"
+            " -> sorted largest first",
+            "rectangles = ARC_HELPERS.find_filled_rectangles(grid, color=None, connectivity=4)",
+            "symmetry = ARC_HELPERS.detect_symmetries(grid)"
+            " -> returns {'horizontal': bool, 'vertical': bool, 'd4': bool}",
+        ),
+    ),
+    (
+        "Grid extraction and placement (grid plus coordinates -> new grid)",
+        (
+            "patch = ARC_HELPERS.extract_subgrid(grid, top_left=(r, c), size=(rows, cols))",
+            "updated = ARC_HELPERS.paste_subgrid(grid, patch, top_left=(r, c))",
+            "rotated = ARC_HELPERS.rotate_grid(grid, quarter_turns)",
+            "reflected = ARC_HELPERS.reflect_grid(grid, axis='horizontal'|'vertical'|'main_diag'|'anti_diag')",
+            "placed = ARC_HELPERS.place_relative_object(grid, relative_cells, color, top_left=(r, c))",
+        ),
+    ),
+    (
+        "Cell coordinate utilities (lists of (row, col) -> transformed coordinates)",
+        (
+            "relative = ARC_HELPERS.to_relative_coordinates(cells)",
+            "shifted = ARC_HELPERS.translate_cells(cells, offset=(dr, dc))",
+        ),
+    ),
+)
 
 
-def _format_api_reference(functions: Mapping[str, object]) -> str:
-    lines: List[str] = []
-    for name in sorted(functions):
-        obj = functions[name]
-        if not callable(obj):
-            continue
-        try:
-            signature = str(inspect.signature(obj))
-        except (TypeError, ValueError):
-            signature = "(...)"
-        doc = inspect.getdoc(obj) or ""
-        first_paragraph = doc.split("\n\n")[0] if doc else ""
-        formatted = f"def {name}{signature}:"\
-            f"\n    {first_paragraph.replace('\n', '\n    ')}"
-        lines.append(formatted)
-    return "\n\n".join(lines)
+def _format_prompt_summary() -> Tuple[str, Sequence[str]]:
+    summary_lines = [
+        "The runtime preloads a small library of ARC utility functions and exposes"
+        " them under the name `ARC_HELPERS`. Call them directly inside your"
+        " solver instead of reimplementing common routines.",
+    ]
+    group_blocks: List[str] = []
+    for title, examples in PROMPT_GROUPS:
+        block_lines = [title + ":"]
+        block_lines.extend(f"  - {example}" for example in examples)
+        group_blocks.append("\n".join(block_lines))
+    return "\n".join(summary_lines), tuple(group_blocks)
 
 
 def get_helper_library() -> HelperLibrary:
@@ -369,17 +386,17 @@ def get_helper_library() -> HelperLibrary:
         if not name.startswith("_") and name in globals()
     }
     functions = {k: v for k, v in exports.items() if callable(v)}
-    overview = _format_overview(functions)
-    api_reference = _format_api_reference(functions)
-    source = Path(__file__).read_text(encoding="utf-8")
+    prompt_summary, prompt_groups = _format_prompt_summary()
+    source_bytes = Path(__file__).read_bytes()
+    source_digest = sha256(source_bytes).hexdigest()
     module_filename = str(Path(__file__).resolve())
     return HelperLibrary(
         namespace=HELPER_NAMESPACE,
         functions=functions,
-        prompt_overview=overview,
-        api_reference=dedent(api_reference.strip()),
-        source=source,
+        prompt_summary=prompt_summary,
+        prompt_groups=prompt_groups,
         module_filename=module_filename,
+        source_digest=source_digest,
     )
 
 
