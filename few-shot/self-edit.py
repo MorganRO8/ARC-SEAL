@@ -278,23 +278,23 @@ def score_grid_prediction(
     exact_match = overall_matches == total_cells
 
     mismatched_unchanged = int(np.count_nonzero(~change_mask & ~matches))
+    correct_changed = int(np.count_nonzero(change_mask & matches))
+    incorrect_cells = int(total_cells - overall_matches)
 
     if changed_cells > 0:
-        correct_changed = int(np.count_nonzero(change_mask & matches))
-        reward_before_cap = (
-            float(correct_changed) / float(changed_cells) if changed_cells else 0.0
+        reward = (
+            float(correct_changed) / float(changed_cells)
+            - float(incorrect_cells) / float(total_cells)
         )
-        overall_accuracy = float(overall_matches) / float(total_cells)
-        reward = min(reward_before_cap, overall_accuracy)
-        correct_cells = correct_changed
-        total_considered = changed_cells
     else:
-        correct_changed = 0
-        reward_before_cap = float(overall_matches) / float(total_cells)
-        reward = reward_before_cap
-        overall_accuracy = reward
-        correct_cells = overall_matches
-        total_considered = total_cells
+        # No cells differ from the reference; fall back to overall accuracy.
+        reward = 1.0 - float(incorrect_cells) / float(total_cells)
+
+    reward = max(0.0, min(1.0, reward))
+
+    # For reporting we still highlight the cells that required intervention.
+    correct_cells = correct_changed if changed_cells > 0 else overall_matches
+    total_considered = changed_cells if changed_cells > 0 else total_cells
 
     details: Dict[str, Any] = {
         "reference_type": reference_name,
@@ -305,8 +305,13 @@ def score_grid_prediction(
         "correct_changed_cells": int(correct_changed),
         "mismatched_unchanged_cells": int(mismatched_unchanged),
         "overall_matches": int(overall_matches),
-        "overall_accuracy": float(overall_accuracy),
-        "reward_before_accuracy_cap": float(reward_before_cap),
+        "incorrect_cells": int(incorrect_cells),
+        "reward_changed_component": (
+            float(correct_changed) / float(changed_cells)
+            if changed_cells > 0
+            else None
+        ),
+        "reward_penalty_component": float(incorrect_cells) / float(total_cells),
         "exact_match": bool(exact_match),
     }
 

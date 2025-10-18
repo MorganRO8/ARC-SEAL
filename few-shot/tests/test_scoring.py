@@ -40,6 +40,8 @@ class ScoreGridPredictionTests(unittest.TestCase):
         self.assertEqual(details["reference_type"], "input")
         self.assertEqual(details["cells_requiring_change"], 1)
         self.assertTrue(details["exact_match"])
+        self.assertAlmostEqual(details["reward_changed_component"], 1.0)
+        self.assertAlmostEqual(details["reward_penalty_component"], 0.0)
 
     def test_returns_zero_reward_when_changes_not_matched(self) -> None:
         input_grid = np.array([[0, 0], [0, 0]])
@@ -58,6 +60,8 @@ class ScoreGridPredictionTests(unittest.TestCase):
         self.assertEqual(total, 1)
         self.assertEqual(details["reference_type"], "input")
         self.assertFalse(details["exact_match"])
+        self.assertAlmostEqual(details["reward_changed_component"], 0.0)
+        self.assertAlmostEqual(details["reward_penalty_component"], 0.25)
 
     def test_identity_outputs_use_overall_accuracy(self) -> None:
         input_grid = np.array([[1, 2], [3, 4]])
@@ -77,6 +81,11 @@ class ScoreGridPredictionTests(unittest.TestCase):
         self.assertEqual(correct, expected.size - 1)
         self.assertAlmostEqual(reward, (expected.size - 1) / expected.size)
         self.assertFalse(details["exact_match"])
+        self.assertIsNone(details["reward_changed_component"])
+        self.assertAlmostEqual(
+            details["reward_penalty_component"],
+            1.0 / expected.size,
+        )
 
     def test_penalises_errors_on_unchanged_cells(self) -> None:
         input_grid = np.array([[0, 0, 0], [0, 0, 0], [0, 0, 0]])
@@ -100,6 +109,11 @@ class ScoreGridPredictionTests(unittest.TestCase):
         self.assertAlmostEqual(
             reward,
             (expected.size - 1) / expected.size,
+        )
+        self.assertAlmostEqual(details["reward_changed_component"], 1.0)
+        self.assertAlmostEqual(
+            details["reward_penalty_component"],
+            1.0 / expected.size,
         )
 
 
