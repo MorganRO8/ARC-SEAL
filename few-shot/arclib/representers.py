@@ -187,18 +187,57 @@ class RotatedGridRepresenter(GridRepresenter):
 
 
 class DiagonalSliceRepresenter(GridRepresenter):
-    """Render diagonals that run from the top-right to the bottom-left."""
+    """Render diagonals for a grid in textual form."""
+
+    _DIRECTION_HEADERS = {
+        "top-right-to-bottom-left": "Top-right to bottom-left diagonals:",
+        "top-left-to-bottom-right": "Top-left to bottom-right diagonals:",
+    }
 
     def __init__(
         self,
         *,
         column_sep: str = " ",
-        header: str = "Top-right to bottom-left diagonals:",
+        direction: str = "top-right-to-bottom-left",
+        header: Optional[str] = None,
     ):
-        self.column_sep = column_sep
-        self.header = header
+        if direction not in self._DIRECTION_HEADERS:
+            raise ValueError(
+                "direction must be either 'top-right-to-bottom-left' or "
+                "'top-left-to-bottom-right'"
+            )
 
-    def encode(self, grid: Grid, **_: object) -> str:
+        self.column_sep = column_sep
+        self.direction = direction
+        self.header = header or self._DIRECTION_HEADERS[direction]
+
+    def _encode_top_right_to_bottom_left(self, grid: Grid) -> List[str]:
+        rows, cols = grid.shape
+        diagonals: List[str] = []
+
+        for start_col in range(cols - 1, -1, -1):
+            diag_values = []
+            row = 0
+            col = start_col
+            while row < rows and col >= 0:
+                diag_values.append(str(grid[row][col]))
+                row += 1
+                col -= 1
+            diagonals.append(self.column_sep.join(diag_values))
+
+        for start_row in range(1, rows):
+            diag_values = []
+            row = start_row
+            col = cols - 1
+            while row < rows and col >= 0:
+                diag_values.append(str(grid[row][col]))
+                row += 1
+                col -= 1
+            diagonals.append(self.column_sep.join(diag_values))
+
+        return diagonals
+
+    def _encode_top_left_to_bottom_right(self, grid: Grid) -> List[str]:
         rows, cols = grid.shape
         diagonals: List[str] = []
 
@@ -222,6 +261,14 @@ class DiagonalSliceRepresenter(GridRepresenter):
                 col += 1
             diagonals.append(self.column_sep.join(diag_values))
 
+        return diagonals
+
+    def encode(self, grid: Grid, **_: object) -> str:
+        if self.direction == "top-right-to-bottom-left":
+            diagonals = self._encode_top_right_to_bottom_left(grid)
+        else:
+            diagonals = self._encode_top_left_to_bottom_right(grid)
+
         diagonal_text = "\n".join(diagonals)
         return f"{self.header}\n{diagonal_text}"
 
@@ -233,7 +280,9 @@ class DiagonalSliceRepresenter(GridRepresenter):
     def __repr__(self) -> str:
         return (
             "DiagonalSliceRepresenter("
-            f"column_sep={self.column_sep!r}, header={self.header!r})"
+            f"column_sep={self.column_sep!r}, "
+            f"direction={self.direction!r}, "
+            f"header={self.header!r})"
         )
 
 # Used in BARC
@@ -531,8 +580,8 @@ def build_text_grid_representer(include_spatial_views: bool = False) -> GridRepr
 
     When ``include_spatial_views`` is ``True`` the function returns a
     :class:`CompositeRepresenter` that concatenates the standard Python list
-    serialization with a 90° clockwise rotation and the diagonals running from
-    the top-right to the bottom-left.  This keeps the original representation in
+    serialization with a 90° clockwise rotation and the diagonals running in
+    both directions.  This keeps the original representation in
     place so downstream tooling that expects ``PythonListGridRepresenter``
     strings continues to function, while also exposing richer spatial context to
     the language model.
@@ -546,11 +595,17 @@ def build_text_grid_representer(include_spatial_views: bool = False) -> GridRepr
         base=DelimitedGridRepresenter(column_sep=COLUMN_SEP, row_sep=ROW_SEP),
         header="Rotated 90° clockwise view:",
     )
-    diagonals = DiagonalSliceRepresenter(
+    diagonals_tr_bl = DiagonalSliceRepresenter(
         column_sep=COLUMN_SEP,
+        direction="top-right-to-bottom-left",
         header="Top-right to bottom-left diagonals:",
     )
-    return CompositeRepresenter([base, rotated, diagonals])
+    diagonals_tl_br = DiagonalSliceRepresenter(
+        column_sep=COLUMN_SEP,
+        direction="top-left-to-bottom-right",
+        header="Top-left to bottom-right diagonals:",
+    )
+    return CompositeRepresenter([base, rotated, diagonals_tr_bl, diagonals_tl_br])
 
 
 class ImageGridRepresenter(GridRepresenter):

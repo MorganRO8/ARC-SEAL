@@ -38,7 +38,7 @@ Passing `--no_vllm_enforce_eager` re-enables `torch.compile` graph capture if yo
 
 ### Optional spatial prompt views
 
-`self-edit.py`, `predict_baseline.py`, `predict_custom.py`, `eval-self-edits.py`, and `eval-self-edits-baseline.py` expose an `--include_spatial_grid_views` flag that augments the usual Python list serialization of each grid with a 90° clockwise rotation and the diagonals running from the top-right to the bottom-left.  This composite view helps the language model reason about vertical, horizontal, and diagonal relationships without leaving the text modality.  Leave the flag unset to retain the original prompts when comparing runs.
+`self-edit.py`, `predict_baseline.py`, `predict_custom.py`, `eval-self-edits.py`, and `eval-self-edits-baseline.py` expose an `--include_spatial_grid_views` flag that augments the usual Python list serialization of each grid with a 90° clockwise rotation plus diagonals running in both directions (top-right → bottom-left and top-left → bottom-right).  This composite view helps the language model reason about vertical, horizontal, and diagonal relationships without leaving the text modality.  Leave the flag unset to retain the original prompts when comparing runs.
 
 ### 1. Training on 12 Problems (Iteration 1)
 

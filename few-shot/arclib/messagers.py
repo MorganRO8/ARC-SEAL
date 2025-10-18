@@ -503,7 +503,7 @@ class GPTTextMessageRepresenterV2(MessageRepresenter):
             else:
                 prompt += (
                     "The input-output grids are provided with multiple textual views, "
-                    "including rotations and diagonals, alongside the base python array representation:\n"
+                    "including rotations and diagonals in both directions, alongside the base python array representation:\n"
                 )
 
         for example in task.train_examples:
