@@ -360,6 +360,42 @@ def detect_unbounded_control_flow(code: str) -> Optional[str]:
     return None
 
 
+def _format_progress_details(attempt_entry: Dict[str, Any]) -> str:
+    """Return a human-readable summary of grid progress for logging."""
+
+    parts: List[str] = []
+
+    changed_total = attempt_entry.get("cells_requiring_change")
+    correct_changed = attempt_entry.get("correct_changed_cells")
+    correct_cells = attempt_entry.get("correct_cells")
+    total_cells = attempt_entry.get("total_cells")
+
+    if (
+        changed_total is not None
+        and changed_total > 0
+        and correct_changed is not None
+    ):
+        parts.append(f"{int(correct_changed)}/{int(changed_total)} changed")
+    elif correct_cells is not None and total_cells is not None:
+        parts.append(f"{int(correct_cells)}/{int(total_cells)} cells")
+
+    mismatched = attempt_entry.get("mismatched_unchanged_cells")
+    if mismatched:
+        parts.append(f"penalized {int(mismatched)}")
+
+    incorrect = attempt_entry.get("incorrect_cells")
+    if incorrect is not None:
+        baseline = int(mismatched) if mismatched else 0
+        extra_incorrect = int(incorrect) - baseline
+        if extra_incorrect > 0:
+            parts.append(f"incorrect {extra_incorrect}")
+
+    if not parts:
+        return ""
+
+    return " (" + "; ".join(parts) + ")"
+
+
 _INDENTATION_PHRASES = (
     "indentationerror",
     "unexpected indent",
@@ -1474,6 +1510,24 @@ def main(
                         attempt_entry["normalized_output"] = local_normalized_output
                     if local_reward_details:
                         attempt_entry["grid_reward_details"] = dict(local_reward_details)
+                        for key in (
+                            "cells_requiring_change",
+                            "cells_unchanged",
+                            "correct_changed_cells",
+                            "mismatched_unchanged_cells",
+                            "incorrect_cells",
+                            "overall_matches",
+                            "penalized_cells",
+                        ):
+                            if key in local_reward_details and local_reward_details[key] is not None:
+                                attempt_entry[key] = int(local_reward_details[key])
+                        for key in (
+                            "reward_changed_component",
+                            "reward_penalty_component",
+                            "reward_penalty_component_raw",
+                        ):
+                            if key in local_reward_details and local_reward_details[key] is not None:
+                                attempt_entry[key] = float(local_reward_details[key])
                     if expected_output is not None:
                         attempt_entry["target_output"] = expected_output.tolist()
                     if size_hint is not None:
@@ -1557,14 +1611,9 @@ def main(
                         if isinstance(reward, (int, float))
                         else reward
                     )
-                    correct_cells = attempt_entry.get("correct_cells")
-                    total_cells = attempt_entry.get("total_cells")
                     reward_reason = attempt_entry.get("grid_evaluation_reason")
 
-                    if correct_cells is not None and total_cells is not None:
-                        progress_str = f" ({correct_cells}/{total_cells} cells)"
-                    else:
-                        progress_str = ""
+                    progress_str = _format_progress_details(attempt_entry)
 
                     if reward_reason:
                         detail = reward_reason
@@ -1583,11 +1632,7 @@ def main(
                                 "shape_mismatch "
                                 f"{predicted_shape}!={expected_output.shape}"
                             )
-                        progress_str = (
-                            f"{progress_str} [{detail}]"
-                            if progress_str
-                            else f"[{detail}]"
-                        )
+                        progress_str = f"{progress_str} [{detail}]" if progress_str else f"[{detail}]"
 
                     print(
                         f"New program for task {base_task_name}: success={attempt_entry.get('success', False)}, "
