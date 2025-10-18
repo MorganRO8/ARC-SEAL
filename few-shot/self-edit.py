@@ -25,7 +25,6 @@ from arclib.arc import (
     to_tuple,
 )
 from arclib.representers import (
-    CompositeRepresenter,
     ConnectedComponentRepresenter,
     DelimitedGridRepresenter,
     DiffExampleRepresenter,
@@ -36,6 +35,7 @@ from arclib.representers import (
     TextTaskRepresenter,
     TextExampleRepresenter,
     WordGridRepresenter,
+    build_text_grid_representer,
 )
 from arclib.messagers import (
     GPTTextMessageRepresenterForBarc,
@@ -923,6 +923,7 @@ def main(
     vllm_enforce_eager: bool = True,
     vllm_tensor_parallel_size: int = 1,
     include_solver_helpers: bool = False,
+    include_spatial_grid_views: bool = False,
 ):
     # lora config
     lora_config = LoraConfig(
@@ -950,7 +951,9 @@ def main(
                 input_header="",
                 output_header="",
                 output_footer="#",
-                grid_representer=PythonListGridRepresenter(),
+                grid_representer=build_text_grid_representer(
+                    include_spatial_grid_views
+                ),
             )
         )
 
@@ -1949,6 +1952,8 @@ if __name__ == "__main__":
                       help='Disable eager enforcement if you prefer torch.compile graphs.')
     parser.add_argument('--include_solver_helpers', action='store_true',
                       help='Expose the curated ARC solver helper library to code-mode runs and describe it in prompts.')
+    parser.add_argument('--include_spatial_grid_views', action='store_true',
+                      help='Augment textual prompts with rotated and diagonal grid views.')
     parser.set_defaults(vllm_enforce_eager=True)
 
     args = parser.parse_args()
@@ -1978,6 +1983,7 @@ if __name__ == "__main__":
         vllm_enforce_eager=args.vllm_enforce_eager,
         vllm_tensor_parallel_size=args.vllm_tensor_parallel_size,
         include_solver_helpers=args.include_solver_helpers,
+        include_spatial_grid_views=args.include_spatial_grid_views,
     )
     
    

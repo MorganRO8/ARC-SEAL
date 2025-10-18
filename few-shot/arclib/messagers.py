@@ -483,14 +483,28 @@ class GPTTextMessageRepresenterV2(MessageRepresenter):
         elif isinstance(
             self.task_representer.example_representer.grid_representer, CompositeRepresenter
         ):
-            connected_component = kwargs.get(
-                "connected_component",
-                self.task_representer.example_representer.grid_representer.connected_component,
-            )
-            connected_component = (
-                "including diagonals" if connected_component == 8 else "excluding diagonals"
-            )
-            prompt += f"The input-output grids are provided as both python arrays and indices of connected shapes ({connected_component}) of the same color:\n"
+            composite = self.task_representer.example_representer.grid_representer
+            if any(
+                isinstance(representer, ConnectedComponentRepresenter)
+                for representer in getattr(composite, "representers", [])
+            ):
+                connected_component = kwargs.get(
+                    "connected_component", composite.connected_component
+                )
+                connected_component = (
+                    "including diagonals"
+                    if connected_component == 8
+                    else "excluding diagonals"
+                )
+                prompt += (
+                    "The input-output grids are provided as both python arrays and "
+                    f"indices of connected shapes ({connected_component}) of the same color:\n"
+                )
+            else:
+                prompt += (
+                    "The input-output grids are provided with multiple textual views, "
+                    "including rotations and diagonals, alongside the base python array representation:\n"
+                )
 
         for example in task.train_examples:
             query, output = self.task_representer.example_representer.encode(example, **kwargs)
