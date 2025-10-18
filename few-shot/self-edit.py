@@ -315,6 +315,12 @@ def score_grid_prediction(
         "exact_match": bool(exact_match),
     }
 
+    if exact_match:
+        reward = 1.0
+        details["reward_penalty_component"] = 0.0
+        if changed_cells > 0:
+            details["reward_changed_component"] = 1.0
+
     return reward, correct_cells, total_considered, adjustment_reason, normalized_array, details
 
 
