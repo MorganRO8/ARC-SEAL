@@ -281,16 +281,20 @@ def score_grid_prediction(
     correct_changed = int(np.count_nonzero(change_mask & matches))
     incorrect_cells = int(total_cells - overall_matches)
 
+    penalty_component_raw: Optional[float]
     if changed_cells > 0:
-        reward = (
-            float(correct_changed) / float(changed_cells)
-            - float(incorrect_cells) / float(total_cells)
-        )
+        reward_changed_component = float(correct_changed) / float(changed_cells)
+        penalty_component_raw = float(mismatched_unchanged) / float(changed_cells)
+        penalty_component = min(1.0, penalty_component_raw)
+        reward = reward_changed_component - penalty_component
     else:
         # No cells differ from the reference; fall back to overall accuracy.
-        reward = 1.0 - float(incorrect_cells) / float(total_cells)
+        penalty_component = float(incorrect_cells) / float(total_cells)
+        reward_changed_component = None
+        penalty_component_raw = None
+        reward = 1.0 - penalty_component
 
-    reward = max(0.0, min(1.0, reward))
+    reward = max(-1.0, min(1.0, reward))
 
     # For reporting we still highlight the cells that required intervention.
     correct_cells = correct_changed if changed_cells > 0 else overall_matches
@@ -306,12 +310,16 @@ def score_grid_prediction(
         "mismatched_unchanged_cells": int(mismatched_unchanged),
         "overall_matches": int(overall_matches),
         "incorrect_cells": int(incorrect_cells),
-        "reward_changed_component": (
-            float(correct_changed) / float(changed_cells)
+        "penalized_cells": int(mismatched_unchanged),
+        "reward_changed_component": reward_changed_component,
+        "reward_penalty_component": (
+            penalty_component
             if changed_cells > 0
-            else None
+            else float(incorrect_cells) / float(total_cells)
         ),
-        "reward_penalty_component": float(incorrect_cells) / float(total_cells),
+        "reward_penalty_component_raw": (
+            penalty_component_raw if changed_cells > 0 else None
+        ),
         "exact_match": bool(exact_match),
     }
 
@@ -320,6 +328,15 @@ def score_grid_prediction(
         details["reward_penalty_component"] = 0.0
         if changed_cells > 0:
             details["reward_changed_component"] = 1.0
+
+    if changed_cells > 0:
+        details["reward_penalty_component"] = min(
+            1.0, float(mismatched_unchanged) / float(changed_cells)
+        )
+        details["reward_penalty_component_raw"] = (
+            float(mismatched_unchanged) / float(changed_cells)
+        )
+
 
     return reward, correct_cells, total_considered, adjustment_reason, normalized_array, details
 

@@ -61,7 +61,8 @@ class ScoreGridPredictionTests(unittest.TestCase):
         self.assertEqual(details["reference_type"], "input")
         self.assertFalse(details["exact_match"])
         self.assertAlmostEqual(details["reward_changed_component"], 0.0)
-        self.assertAlmostEqual(details["reward_penalty_component"], 0.25)
+        self.assertAlmostEqual(details["reward_penalty_component"], 0.0)
+        self.assertAlmostEqual(details["reward_penalty_component_raw"], 0.0)
 
     def test_identity_outputs_use_overall_accuracy(self) -> None:
         input_grid = np.array([[1, 2], [3, 4]])
@@ -106,15 +107,36 @@ class ScoreGridPredictionTests(unittest.TestCase):
         self.assertEqual(total, 1)
         self.assertEqual(details["mismatched_unchanged_cells"], 1)
         self.assertLess(reward, 1.0)
-        self.assertAlmostEqual(
-            reward,
-            (expected.size - 1) / expected.size,
-        )
+        self.assertAlmostEqual(reward, 0.0)
         self.assertAlmostEqual(details["reward_changed_component"], 1.0)
         self.assertAlmostEqual(
             details["reward_penalty_component"],
-            1.0 / expected.size,
+            1.0,
         )
+        self.assertEqual(details["penalized_cells"], 1)
+        self.assertAlmostEqual(details["reward_penalty_component_raw"], 1.0)
+
+    def test_negative_reward_when_many_cells_corrupted(self) -> None:
+        input_grid = np.zeros((2, 2), dtype=int)
+        expected = input_grid.copy()
+        expected[0, 0] = 1
+
+        predicted = np.array([[9, 9], [9, 9]])
+
+        reward, correct, total, reason, _, details = score_grid_prediction(
+            predicted,
+            expected,
+            reference_input=input_grid,
+        )
+
+        self.assertIsNone(reason)
+        self.assertEqual(correct, 0)
+        self.assertEqual(total, 1)
+        self.assertLess(reward, 0.0)
+        self.assertGreaterEqual(reward, -1.0)
+        self.assertEqual(details["penalized_cells"], 3)
+        self.assertAlmostEqual(details["reward_penalty_component"], 1.0)
+        self.assertGreater(details["reward_penalty_component_raw"], 1.0)
 
 
 if __name__ == "__main__":  # pragma: no cover
