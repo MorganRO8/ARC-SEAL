@@ -606,6 +606,8 @@ def _tokenize_and_process(
     tokenizer,
     *,
     loss_on_all_tokens: bool = False,
+    messages: Optional[List[Dict[str, Any]]] = None,
+    chat_template_kwargs: Optional[Dict[str, Any]] = None,
 ):
     """Tokenize a chat transcript and mask non-response tokens."""
 
@@ -620,21 +622,33 @@ def _tokenize_and_process(
     labels = input_ids.clone()
 
     if not loss_on_all_tokens:
-        ids_list = input_ids.tolist()
-        special_indices = []
-        for i in range(len(ids_list) - 1):
-            if ids_list[i] == 128007 and ids_list[i + 1] == 271:
-                special_indices.append(i + 1)
+        prompt_token_count = 0
+        if messages:
+            prompt_messages = messages[:-1]
+            if prompt_messages:
+                try:
+                    extra_kwargs = dict(chat_template_kwargs or {})
+                    prompt_text = tokenizer.apply_chat_template(
+                        prompt_messages,
+                        tokenize=False,
+                        add_generation_prompt=True,
+                        **extra_kwargs,
+                    )
+                    prompt_outputs = tokenizer(
+                        prompt_text,
+                        truncation=True,
+                        return_tensors="pt",
+                    )
+                    prompt_ids = (
+                        prompt_outputs["input_ids"].squeeze(0).to(torch.long).cpu()
+                    )
+                    prompt_token_count = prompt_ids.numel()
+                except Exception:
+                    prompt_token_count = 0
 
-        if not special_indices:
-            raise ValueError("Assistant header token sequence not found in sample.")
-
-        if len(special_indices) >= 2:
-            special_index = special_indices[-2]
-        else:
-            special_index = special_indices[-1]
-
-        labels[: special_index + 1] = -100
+        if prompt_token_count > 0:
+            prompt_token_count = min(prompt_token_count, labels.size(0))
+            labels[:prompt_token_count] = -100
 
     return {
         "input_ids": input_ids,
@@ -677,8 +691,10 @@ def format_and_filter(
                     chat_text,
                     tokenizer,
                     loss_on_all_tokens=train_on_input,
+                    messages=chat_messages,
+                    chat_template_kwargs=extra_kwargs,
                 )
-            except ValueError as error:
+            except Exception as error:
                 print(f"Skipping transcript due to tokenization error: {error}")
                 return None
 
@@ -707,8 +723,10 @@ def format_and_filter(
             task_text,
             tokenizer,
             loss_on_all_tokens=train_on_input,
+            messages=chat_messages,
+            chat_template_kwargs=extra_kwargs,
         )
-    except ValueError as error:
+    except Exception as error:
         print(f"Skipping formatted task due to tokenization error: {error}")
         return None
 
@@ -1564,12 +1582,35 @@ def main(
                         )
                         attempt_entry["full_text"] = chat_text
                         try:
-                            tokenized = _tokenize_and_process(chat_text, tokenizer)
-                        except ValueError as error:
-                            print(
-                                f"Failed to tokenize successful program for {base_task_name}: {error}"
+                            tokenized = _tokenize_and_process(
+                                chat_text,
+                                tokenizer,
+                                messages=chat_messages,
+                                chat_template_kwargs=chat_template_kwargs,
                             )
-                            attempt_entry["tokenized"] = None
+                        except Exception as error:
+                            print(
+                                "Failed to tokenize successful program for "
+                                f"{base_task_name}: {error}; falling back to"
+                                " full-loss tokenization."
+                            )
+                            try:
+                                tokenized = _tokenize_and_process(
+                                    chat_text,
+                                    tokenizer,
+                                    loss_on_all_tokens=True,
+                                )
+                            except Exception as fallback_error:
+                                print(
+                                    "Fallback tokenization also failed for "
+                                    f"{base_task_name}: {fallback_error}"
+                                )
+                                attempt_entry["tokenized"] = None
+                            else:
+                                attempt_entry["tokenized"] = tokenized
+                                attempt_entry["total_tokens"] = int(
+                                    tokenized["attention_mask"].sum().item()
+                                )
                         else:
                             attempt_entry["tokenized"] = tokenized
                             attempt_entry["total_tokens"] = int(
