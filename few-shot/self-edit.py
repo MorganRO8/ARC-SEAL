@@ -182,28 +182,38 @@ def score_grid_prediction(
     expected_output: Optional[np.ndarray],
     *,
     shape_hint: Optional[Tuple[int, int]] = None,
-) -> Tuple[float, Optional[int], Optional[int], Optional[str], Optional[np.ndarray]]:
-    """Compute partial-credit reward for a predicted grid.
+    reference_input: Optional[np.ndarray] = None,
+) -> Tuple[
+    float,
+    Optional[int],
+    Optional[int],
+    Optional[str],
+    Optional[np.ndarray],
+    Dict[str, Any],
+]:
+    """Compute a normalized partial-credit reward for a predicted grid.
 
-    Returns ``(reward, correct_cells, total_cells, reason, normalized_output)``.
-    ``normalized_output`` is the grid actually compared against the target after
-    any padding/cropping. ``reason`` is ``None`` when a comparison succeeded.
+    Returns ``(reward, correct_cells, total_cells, reason, normalized_output,
+    details)``. ``normalized_output`` is the grid actually compared against the
+    target after any padding/cropping. ``reason`` is ``None`` when a comparison
+    succeeded. ``details`` contains metadata about the chosen reference grid and
+    intermediate statistics used to compute the reward.
     """
 
     if expected_output is None:
-        return 0.0, None, None, "missing_target", None
+        return 0.0, None, None, "missing_target", None, {}
     if predicted_output is None:
-        return 0.0, None, None, "missing_prediction", None
+        return 0.0, None, None, "missing_prediction", None, {}
 
     try:
         predicted_array = np.asarray(predicted_output, dtype=int)
     except (TypeError, ValueError):
-        return 0.0, None, None, "non_integer_prediction", None
+        return 0.0, None, None, "non_integer_prediction", None, {}
 
     try:
         expected_array = np.asarray(expected_output, dtype=int)
     except (TypeError, ValueError):
-        return 0.0, None, None, "invalid_target", None
+        return 0.0, None, None, "invalid_target", None, {}
 
     target_shape = expected_array.shape
     normalized_array = predicted_array
@@ -221,17 +231,86 @@ def score_grid_prediction(
                 f"{predicted_array.shape[:2]}->{tuple(shape_hint)}"
             )
         else:
-            return 0.0, 0, int(expected_array.size), "shape_mismatch", predicted_array
+            return 0.0, 0, int(expected_array.size), "shape_mismatch", predicted_array, {}
 
     total_cells = int(expected_array.size)
     if total_cells == 0:
-        return 0.0, 0, 0, "empty_target", normalized_array
+        return 0.0, 0, 0, "empty_target", normalized_array, {}
+
+    # Build candidate reference grids: blank grid and (optionally) the input grid.
+    reference_candidates: List[Tuple[str, np.ndarray, int, Dict[str, Any]]] = []
+    blank_reference = np.zeros(target_shape, dtype=int)
+    blank_diff = int(np.count_nonzero(blank_reference != expected_array))
+    reference_candidates.append(("blank", blank_reference, blank_diff, {"adjusted": False}))
+
+    if reference_input is not None:
+        try:
+            input_array = np.asarray(reference_input, dtype=int)
+        except (TypeError, ValueError):
+            input_array = None
+        if input_array is not None:
+            input_adjusted = False
+            if input_array.shape != target_shape:
+                input_array = _pad_or_crop_to_shape(input_array, target_shape)
+                input_adjusted = True
+            input_diff = int(np.count_nonzero(input_array != expected_array))
+            reference_candidates.append(
+                (
+                    "input",
+                    input_array,
+                    input_diff,
+                    {"adjusted": input_adjusted},
+                )
+            )
+
+    # Prefer the candidate with the fewest differing cells; break ties in favour
+    # of the input grid because it conveys more structure than a blank canvas.
+    reference_name, reference_array, reference_diff, reference_meta = min(
+        reference_candidates,
+        key=lambda item: (item[2], 0 if item[0] == "input" else 1),
+    )
+
+    change_mask = expected_array != reference_array
+    changed_cells = int(np.count_nonzero(change_mask))
 
     matches = normalized_array == expected_array
-    correct_cells = int(np.count_nonzero(matches))
-    reward = float(correct_cells) / float(total_cells) if total_cells else 0.0
+    overall_matches = int(np.count_nonzero(matches))
+    exact_match = overall_matches == total_cells
 
-    return reward, correct_cells, total_cells, adjustment_reason, normalized_array
+    mismatched_unchanged = int(np.count_nonzero(~change_mask & ~matches))
+
+    if changed_cells > 0:
+        correct_changed = int(np.count_nonzero(change_mask & matches))
+        reward_before_cap = (
+            float(correct_changed) / float(changed_cells) if changed_cells else 0.0
+        )
+        overall_accuracy = float(overall_matches) / float(total_cells)
+        reward = min(reward_before_cap, overall_accuracy)
+        correct_cells = correct_changed
+        total_considered = changed_cells
+    else:
+        correct_changed = 0
+        reward_before_cap = float(overall_matches) / float(total_cells)
+        reward = reward_before_cap
+        overall_accuracy = reward
+        correct_cells = overall_matches
+        total_considered = total_cells
+
+    details: Dict[str, Any] = {
+        "reference_type": reference_name,
+        "reference_difference_cells": int(reference_diff),
+        "reference_input_adjusted": bool(reference_meta.get("adjusted", False)),
+        "cells_requiring_change": int(changed_cells),
+        "cells_unchanged": int(total_cells - changed_cells),
+        "correct_changed_cells": int(correct_changed),
+        "mismatched_unchanged_cells": int(mismatched_unchanged),
+        "overall_matches": int(overall_matches),
+        "overall_accuracy": float(overall_accuracy),
+        "reward_before_accuracy_cap": float(reward_before_cap),
+        "exact_match": bool(exact_match),
+    }
+
+    return reward, correct_cells, total_considered, adjustment_reason, normalized_array, details
 
 
 _SUSPICIOUS_LOOP_PATTERNS: List[Tuple[re.Pattern[str], str]] = [
@@ -1130,6 +1209,7 @@ def main(
                         local_correct_cells = None
                         local_total_cells = None
                         local_reward_reason = None
+                        local_reward_details: Dict[str, Any] = {}
                         local_predicted_output = None
                         local_normalized_output = None
                         local_rejection_reason = None
@@ -1247,10 +1327,12 @@ def main(
                                     local_total_cells,
                                     local_reward_reason,
                                     normalized_array,
+                                    local_reward_details,
                                 ) = score_grid_prediction(
                                     predicted_array,
                                     expected_output,
                                     shape_hint=size_hint,
+                                    reference_input=task.test_example.input,
                                 )
 
                                 if normalized_array is not None:
@@ -1264,7 +1346,9 @@ def main(
                                 if expected_output is None:
                                     local_success = local_exec_result.success
                                 else:
-                                    local_success = local_reward == 1.0
+                                    local_success = bool(
+                                        local_reward_details.get("exact_match", False)
+                                    )
                             else:
                                 if local_exec_result.success and expected_output is None:
                                     local_success = True
@@ -1278,6 +1362,10 @@ def main(
                             execution_payload["grid_evaluation_reason"] = local_reward_reason
                         if local_rejection_reason is not None:
                             execution_payload["rejection_reason"] = local_rejection_reason
+                        if local_reward_details:
+                            execution_payload["grid_reward_details"] = dict(
+                                local_reward_details
+                            )
 
                         local_execution_payload = execution_payload
 
@@ -1356,6 +1444,8 @@ def main(
                         attempt_entry["predicted_output"] = local_predicted_output
                     if local_normalized_output is not None:
                         attempt_entry["normalized_output"] = local_normalized_output
+                    if local_reward_details:
+                        attempt_entry["grid_reward_details"] = dict(local_reward_details)
                     if expected_output is not None:
                         attempt_entry["target_output"] = expected_output.tolist()
                     if size_hint is not None:
