@@ -43,6 +43,7 @@ from arclib.messagers import (
     PythonSolverMessageRepresenter,
 )
 from arclib.update_model import TTT
+from arclib.phase_io import PhaseJSONEncoder, load_phase1_results, save_phase1_results
 from inference.preprocess import get_preprocessed_tasks_single
 
 from arclib.voting import vote
@@ -137,20 +138,6 @@ def read_tasks_from_file(task_file: str, test: bool = False) -> List[Task]:
     with open(task_file, "r", encoding="utf-8") as handle:
         data = json.load(handle)
     return Task.read_tasks_from_dict(data, test=test)
-
-
-class NumpyEncoder(json.JSONEncoder):
-    """Custom JSON encoder to handle NumPy types."""
-    def default(self, obj):
-        if isinstance(obj, np.integer):
-            return int(obj)
-        if isinstance(obj, np.floating):
-            return float(obj)
-        if isinstance(obj, np.ndarray):
-            return obj.tolist()
-        if isinstance(obj, np.bool_):
-            return bool(obj)
-        return super(NumpyEncoder, self).default(obj)
 
 
 def _pad_or_crop_to_shape(
@@ -924,6 +911,8 @@ def main(
     vllm_tensor_parallel_size: int = 1,
     include_solver_helpers: bool = False,
     include_spatial_grid_views: bool = False,
+    phase1_results_path: Optional[str] = None,
+    resume_phase2: bool = False,
 ):
     # lora config
     lora_config = LoraConfig(
@@ -1015,148 +1004,191 @@ def main(
     else:
         chat_template_kwargs = {}
 
-    # Phase 1: Generate configs using self-edit model
-    print("Phase 1: Generating configs using self-edit model...")
-    llm_kwargs = {}
-    if vllm_dtype:
-        llm_kwargs["dtype"] = vllm_dtype
-    if vllm_max_model_len and vllm_max_model_len > 0:
-        llm_kwargs["max_model_len"] = vllm_max_model_len
-    if vllm_max_num_batched_tokens and vllm_max_num_batched_tokens > 0:
-        llm_kwargs["max_num_batched_tokens"] = vllm_max_num_batched_tokens
-    if vllm_gpu_memory_utilization and vllm_gpu_memory_utilization > 0:
-        llm_kwargs["gpu_memory_utilization"] = vllm_gpu_memory_utilization
-    if vllm_tensor_parallel_size and vllm_tensor_parallel_size > 0:
-        llm_kwargs["tensor_parallel_size"] = vllm_tensor_parallel_size
-    llm_kwargs["enforce_eager"] = vllm_enforce_eager
-
-    print(f"Initializing vLLM with kwargs: {llm_kwargs}")
-    self_edit_model = LLM(model=model_name, **llm_kwargs)
-    sampling_params = SamplingParams(
-        max_tokens=128,
-        temperature=0.8,
+    default_phase1_results_path = os.path.join(
+        "loras/self-edit", experiment_name, "phase1_results.json"
     )
+    if phase1_results_path is None:
+        phase1_results_path = default_phase1_results_path
 
-    # Dictionary to store explored configs per task
-    explored_configs = {}
-    task_configs = {}  # Store full configs for each task
+    task_configs: Dict[str, Any]
 
-    total_tasks = min(n_tasks, len(tasks))
-    if n_tasks > len(tasks):
+    if resume_phase2:
+        if not os.path.exists(phase1_results_path):
+            raise FileNotFoundError(
+                f"Phase 1 results not found at {phase1_results_path}; cannot resume."
+            )
         print(
-            f"Requested {n_tasks} tasks but only {len(tasks)} available; limiting to {total_tasks}."
+            "Phase 1: Skipping generation and loading cached results from",
+            phase1_results_path,
+        )
+        persisted_payload = load_phase1_results(phase1_results_path)
+        task_configs = persisted_payload.get("task_configs", {})
+        if not isinstance(task_configs, dict):
+            raise ValueError(
+                "Persisted Phase 1 payload is malformed: 'task_configs' must be a dict."
+            )
+        if not task_configs:
+            print("Warning: Loaded Phase 1 results contain no task configurations.")
+        persisted_metadata = persisted_payload.get("metadata", {})
+        cached_code_mode = persisted_metadata.get("code_mode")
+        if cached_code_mode is not None and cached_code_mode != code_mode:
+            print(
+                "Warning: Cached Phase 1 results were produced with "
+                f"code_mode={cached_code_mode}, but current run uses code_mode={code_mode}."
+            )
+        cached_spatial = persisted_metadata.get("include_spatial_grid_views")
+        if (
+            cached_spatial is not None
+            and bool(cached_spatial) != bool(include_spatial_grid_views)
+        ):
+            print(
+                "Warning: Cached Phase 1 results were generated with "
+                f"include_spatial_grid_views={cached_spatial}, "
+                f"current flag={include_spatial_grid_views}."
+            )
+    else:
+        # Phase 1: Generate configs using self-edit model
+        print("Phase 1: Generating configs using self-edit model...")
+        llm_kwargs = {}
+        if vllm_dtype:
+            llm_kwargs["dtype"] = vllm_dtype
+        if vllm_max_model_len and vllm_max_model_len > 0:
+            llm_kwargs["max_model_len"] = vllm_max_model_len
+        if vllm_max_num_batched_tokens and vllm_max_num_batched_tokens > 0:
+            llm_kwargs["max_num_batched_tokens"] = vllm_max_num_batched_tokens
+        if vllm_gpu_memory_utilization and vllm_gpu_memory_utilization > 0:
+            llm_kwargs["gpu_memory_utilization"] = vllm_gpu_memory_utilization
+        if vllm_tensor_parallel_size and vllm_tensor_parallel_size > 0:
+            llm_kwargs["tensor_parallel_size"] = vllm_tensor_parallel_size
+        llm_kwargs["enforce_eager"] = vllm_enforce_eager
+
+        print(f"Initializing vLLM with kwargs: {llm_kwargs}")
+        self_edit_model = LLM(model=model_name, **llm_kwargs)
+        sampling_params = SamplingParams(
+            max_tokens=128,
+            temperature=0.8,
         )
 
-    progress_bar = tqdm(
-        total=total_tasks,
-        desc="Self-edit tasks",
-        unit="task",
-        position=2,
-        leave=True,
-        dynamic_ncols=True,
-    )
-    progress_bar.refresh()
-    try:
-        for i in range(total_tasks):
-            task = tasks[i]
+        # Dictionary to store explored configs per task
+        explored_configs = {}
+        task_configs = {}  # Store full configs for each task
 
-            # Get the base task name (without -0 or -1 suffix) skip if it has -1 suffix
-            base_task_name = task.name
-            if base_task_name.endswith("-0"):
-                base_task_name = base_task_name[:-2]
-            if base_task_name.endswith("-1"):
-                progress_bar.update(1)
-                continue
+        total_tasks = min(n_tasks, len(tasks))
+        if n_tasks > len(tasks):
+            print(
+                f"Requested {n_tasks} tasks but only {len(tasks)} available; limiting to {total_tasks}."
+            )
 
-            context_budget: Optional[int] = None
-            max_model_len: Optional[int] = None
-            size_hint: Optional[Tuple[int, int]] = None
-            size_metadata: Optional[Dict[str, Any]] = None
-            base_prompt_messages: Optional[List[Dict[str, Any]]] = None
+        progress_bar = tqdm(
+            total=total_tasks,
+            desc="Self-edit tasks",
+            unit="task",
+            position=2,
+            leave=True,
+            dynamic_ncols=True,
+        )
+        progress_bar.refresh()
+        try:
+            for i in range(total_tasks):
+                task = tasks[i]
 
-            if code_mode:
-                size_hint, size_metadata = infer_output_shape(task)
-                if size_hint is not None:
-                    print(
-                        "Inferred output size for",
-                        f"{base_task_name}: {size_hint[0]}×{size_hint[1]}",
-                        f"(method={size_metadata.get('method') if size_metadata else 'unknown'})",
-                    )
-                encoded_messages, _ = representer.encode(
-                    task,
-                    size_inference=(size_hint, size_metadata),
-                    execution_limits=execution_limits_payload,
-                    helper_summary=helper_prompt_summary,
-                    helper_groups=helper_prompt_groups,
-                    helper_namespace=helper_namespace,
-                )
-                base_prompt_messages = [deepcopy(message) for message in encoded_messages]
-
-                def _prepare_prompt(messages: List[Dict[str, Any]]) -> Tuple[str, int]:
-                    prompt_text_local = tokenizer.apply_chat_template(
-                        messages,
-                        tokenize=False,
-                        add_generation_prompt=True,
-                        **chat_template_kwargs,
-                    )
-                    prompt_tokens = tokenizer(
-                        prompt_text_local,
-                        return_tensors="pt",
-                        add_special_tokens=False,
-                    )
-                    prompt_length = int(prompt_tokens["input_ids"].shape[-1])
-                    return prompt_text_local, prompt_length
-
-                try:
-                    base_prompt_text, initial_prompt_length = _prepare_prompt(base_prompt_messages)
-                except ValueError as error:
-                    print(
-                        "Failed to tokenize prompt for task"
-                        f" {base_task_name}: {error}"
-                    )
+                # Get the base task name (without -0 or -1 suffix) skip if it has -1 suffix
+                base_task_name = task.name
+                if base_task_name.endswith("-0"):
+                    base_task_name = base_task_name[:-2]
+                if base_task_name.endswith("-1"):
                     progress_bar.update(1)
                     continue
 
-                if vllm_max_model_len and vllm_max_model_len > 0:
-                    max_model_len = vllm_max_model_len
-                else:
-                    max_model_len = getattr(
-                        getattr(self_edit_model, "llm_engine", None),
-                        "max_model_len",
-                        None,
+                context_budget: Optional[int] = None
+                max_model_len: Optional[int] = None
+                size_hint: Optional[Tuple[int, int]] = None
+                size_metadata: Optional[Dict[str, Any]] = None
+                base_prompt_messages: Optional[List[Dict[str, Any]]] = None
+
+                if code_mode:
+                    size_hint, size_metadata = infer_output_shape(task)
+                    if size_hint is not None:
+                        print(
+                            "Inferred output size for",
+                            f"{base_task_name}: {size_hint[0]}×{size_hint[1]}",
+                            f"(method={size_metadata.get('method') if size_metadata else 'unknown'})",
+                        )
+                    encoded_messages, _ = representer.encode(
+                        task,
+                        size_inference=(size_hint, size_metadata),
+                        execution_limits=execution_limits_payload,
+                        helper_summary=helper_prompt_summary,
+                        helper_groups=helper_prompt_groups,
+                        helper_namespace=helper_namespace,
                     )
-                    if max_model_len is None and getattr(
-                        getattr(self_edit_model, "llm_engine", None),
-                        "model_config",
-                        None,
-                    ) is not None:
+                    base_prompt_messages = [deepcopy(message) for message in encoded_messages]
+
+                    def _prepare_prompt(messages: List[Dict[str, Any]]) -> Tuple[str, int]:
+                        prompt_text_local = tokenizer.apply_chat_template(
+                            messages,
+                            tokenize=False,
+                            add_generation_prompt=True,
+                            **chat_template_kwargs,
+                        )
+                        prompt_tokens = tokenizer(
+                            prompt_text_local,
+                            return_tensors="pt",
+                            add_special_tokens=False,
+                        )
+                        prompt_length = int(prompt_tokens["input_ids"].shape[-1])
+                        return prompt_text_local, prompt_length
+
+                    try:
+                        base_prompt_text, initial_prompt_length = _prepare_prompt(base_prompt_messages)
+                    except ValueError as error:
+                        print(
+                            "Failed to tokenize prompt for task"
+                            f" {base_task_name}: {error}"
+                        )
+                        progress_bar.update(1)
+                        continue
+
+                    if vllm_max_model_len and vllm_max_model_len > 0:
+                        max_model_len = vllm_max_model_len
+                    else:
                         max_model_len = getattr(
-                            self_edit_model.llm_engine.model_config,
+                            getattr(self_edit_model, "llm_engine", None),
                             "max_model_len",
                             None,
                         )
+                        if max_model_len is None and getattr(
+                            getattr(self_edit_model, "llm_engine", None),
+                            "model_config",
+                            None,
+                        ) is not None:
+                            max_model_len = getattr(
+                                self_edit_model.llm_engine.model_config,
+                                "max_model_len",
+                                None,
+                            )
 
-                if max_model_len is not None:
-                    context_budget = max_model_len - (sampling_params.max_tokens or 0)
-                    if context_budget <= 0:
-                        print(
-                            "No room for prompt tokens with current generation "
-                            f"budget (max_model_len={max_model_len}, "
-                            f"max_tokens={sampling_params.max_tokens})."
-                        )
-                        progress_bar.update(1)
-                        continue
+                    if max_model_len is not None:
+                        context_budget = max_model_len - (sampling_params.max_tokens or 0)
+                        if context_budget <= 0:
+                            print(
+                                "No room for prompt tokens with current generation "
+                                f"budget (max_model_len={max_model_len}, "
+                                f"max_tokens={sampling_params.max_tokens})."
+                            )
+                            progress_bar.update(1)
+                            continue
 
-                    if initial_prompt_length > context_budget:
-                        print(
-                            f"Skipping task {base_task_name}: prompt requires "
-                            f"{initial_prompt_length} tokens but only "
-                            f"{context_budget} are available."
-                        )
-                        progress_bar.update(1)
-                        continue
+                        if initial_prompt_length > context_budget:
+                            print(
+                                f"Skipping task {base_task_name}: prompt requires "
+                                f"{initial_prompt_length} tokens but only "
+                                f"{context_budget} are available."
+                            )
+                            progress_bar.update(1)
+                            continue
 
-                def _run_code_mode_attempt() -> Tuple[Optional[Dict[str, Any]], bool, bool]:
+                    def _run_code_mode_attempt() -> Tuple[Optional[Dict[str, Any]], bool, bool]:
                     """Run a single code-mode attempt with feedback-driven retries.
 
                     Returns ``(attempt_entry, skipped, abort_task)`` where ``attempt_entry``
@@ -1739,13 +1771,27 @@ def main(
                 )
                 print(f"New config for task {base_task_name}:", config)
 
-            progress_bar.update(1)
-    finally:
-        progress_bar.close()
+                progress_bar.update(1)
+        finally:
+            progress_bar.close()
 
-    # Delete self-edit model to free memory
-    del self_edit_model
-    print("Phase 1 complete.")
+        # Delete self-edit model to free memory
+        del self_edit_model
+        print("Phase 1 complete.")
+
+        metadata = {
+            "experiment_name": experiment_name,
+            "model_name": model_name,
+            "code_mode": code_mode,
+            "include_spatial_grid_views": include_spatial_grid_views,
+            "n_tasks": total_tasks,
+        }
+        save_phase1_results(
+            phase1_results_path,
+            task_configs,
+            metadata=metadata,
+        )
+        print("Phase 1 results saved to:", phase1_results_path)
 
     # Phase 2: Train models using generated configs
     print("\nPhase 2: Training models using generated configs...")
@@ -1902,7 +1948,7 @@ def main(
     configs_file = os.path.join(f"loras/self-edit/{experiment_name}", "final_configs_and_indices.json")
     os.makedirs(os.path.dirname(configs_file), exist_ok=True)
     with open(configs_file, "w") as f:
-        json.dump(final_configs_and_indices, f)
+        json.dump(final_configs_and_indices, f, cls=PhaseJSONEncoder)
     
     print("Training complete. Final configs and indices saved to:", configs_file)
     
@@ -1954,6 +2000,10 @@ if __name__ == "__main__":
                       help='Expose the curated ARC solver helper library to code-mode runs and describe it in prompts.')
     parser.add_argument('--include_spatial_grid_views', action='store_true',
                       help='Augment textual prompts with rotated and diagonal grid views.')
+    parser.add_argument('--phase1_results_path', type=str, default=None,
+                      help='Optional path to persist Phase 1 outputs (defaults to loras/self-edit/<experiment>/phase1_results.json).')
+    parser.add_argument('--resume_phase2', action='store_true',
+                      help='Skip Phase 1 generation and resume Phase 2 using cached Phase 1 outputs.')
     parser.set_defaults(vllm_enforce_eager=True)
 
     args = parser.parse_args()
@@ -1984,6 +2034,8 @@ if __name__ == "__main__":
         vllm_tensor_parallel_size=args.vllm_tensor_parallel_size,
         include_solver_helpers=args.include_solver_helpers,
         include_spatial_grid_views=args.include_spatial_grid_views,
+        phase1_results_path=args.phase1_results_path,
+        resume_phase2=args.resume_phase2,
     )
     
    

@@ -40,6 +40,8 @@ Passing `--no_vllm_enforce_eager` re-enables `torch.compile` graph capture if yo
 
 `self-edit.py`, `predict_baseline.py`, `predict_custom.py`, `eval-self-edits.py`, and `eval-self-edits-baseline.py` expose an `--include_spatial_grid_views` flag that augments the usual Python list serialization of each grid with a 90° clockwise rotation plus diagonals running in both directions (top-right → bottom-left and top-left → bottom-right).  This composite view helps the language model reason about vertical, horizontal, and diagonal relationships without leaving the text modality.  Leave the flag unset to retain the original prompts when comparing runs.
 
+`self-edit.py` also accepts `--phase1_results_path` to control where the generated Phase 1 configurations are written and `--resume_phase2` to skip regeneration and immediately continue with fine-tuning using the cached results.  The script writes the Phase 1 payload to disk (fsyncing the file by default) before any LoRA training begins so crashes during Phase 2 can be resumed without repeating the earlier self-editing pass.
+
 ### 1. Training on 12 Problems (Iteration 1)
 
 Train the base model on 12 problems from ARC train set:
