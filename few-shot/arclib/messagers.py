@@ -54,7 +54,36 @@ def _grid_to_string(grid: Sequence[Sequence[int]]) -> str:
     return "\n".join(rows)
 
 
-def _format_train_examples_for_prompt(examples: Sequence[Example]) -> str:
+def _encode_grid_for_prompt(
+    grid: Sequence[Sequence[int]],
+    grid_representer: Optional[GridRepresenter],
+) -> str:
+    """Return a prompt-friendly string for ``grid``."""
+
+    array = np.asarray(grid)
+
+    if grid_representer is None:
+        return _grid_to_string(array.tolist())
+
+    if isinstance(grid_representer, PythonListGridRepresenter):
+        return _grid_to_string(array.tolist())
+
+    encoded = grid_representer.encode(array)
+
+    if isinstance(grid_representer, CompositeRepresenter):
+        # ``CompositeRepresenter`` already stitches multiple views together with
+        # explicit headers. Avoid stripping internal whitespace that might
+        # collapse those sections, but do remove a trailing newline if one was
+        # added while composing the views.
+        return encoded.rstrip("\n")
+
+    return encoded
+
+
+def _format_train_examples_for_prompt(
+    examples: Sequence[Example],
+    grid_representer: Optional[GridRepresenter] = None,
+) -> str:
     """Render training examples for inclusion in the Python solver prompt."""
 
     if not examples:
@@ -62,22 +91,28 @@ def _format_train_examples_for_prompt(examples: Sequence[Example]) -> str:
 
     blocks: List[str] = []
     for idx, example in enumerate(examples, start=1):
-        input_grid = _grid_to_string(example.input.tolist())
-        output_grid = _grid_to_string(example.output.tolist())
+        input_grid = _encode_grid_for_prompt(example.input, grid_representer)
+        output_grid = _encode_grid_for_prompt(example.output, grid_representer)
         blocks.append(
             f"Input {idx}:\n{input_grid}\n\nOutput:\n{output_grid}"
         )
     return "\n\n".join(blocks)
 
 
-def _format_test_example_for_prompt(example: Example) -> str:
+def _format_test_example_for_prompt(
+    example: Example,
+    grid_representer: Optional[GridRepresenter] = None,
+) -> str:
     """Render the test example grid(s) for the Python solver prompt."""
 
-    parts = [f"Test input:\n{_grid_to_string(example.input.tolist())}"]
+    parts = [
+        f"Test input:\n{_encode_grid_for_prompt(example.input, grid_representer)}"
+    ]
 
     if getattr(example, "output", None) is not None:
         parts.append(
-            "Expected output:\n" + _grid_to_string(example.output.tolist())
+            "Expected output:\n"
+            + _encode_grid_for_prompt(example.output, grid_representer)
         )
 
     return "\n\n".join(parts)
@@ -575,8 +610,18 @@ class PythonSolverMessageRepresenter(MessageRepresenter):
         if getattr(task, "description", None):
             description = f"Task description:\n{task.description.strip()}\n\n"
 
-        train_examples_text = _format_train_examples_for_prompt(task.train_examples)
-        test_example_text = _format_test_example_for_prompt(task.test_example)
+        grid_representer = getattr(
+            getattr(self.task_representer, "example_representer", None),
+            "grid_representer",
+            None,
+        )
+
+        train_examples_text = _format_train_examples_for_prompt(
+            task.train_examples, grid_representer
+        )
+        test_example_text = _format_test_example_for_prompt(
+            task.test_example, grid_representer
+        )
 
         grid_stats = _summarize_task_grid_dimensions(task, inferred_shape)
         size_guidance = _format_size_guidance(task, inferred_shape, inference_details)
