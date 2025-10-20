@@ -1197,6 +1197,8 @@ def main(
                         ``True`` when the task should stop generating further attempts entirely.
                         """
 
+                        abort_task = False
+
                         if base_prompt_messages is None:
                             return None, False, True
 
@@ -1221,8 +1223,6 @@ def main(
                         local_raw_code: Optional[str] = None
                         local_raw_response: str = ""
                         local_token_ids = None
-
-                        abort_task = False
 
                         while True:
                             try:
