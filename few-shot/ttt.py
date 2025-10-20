@@ -25,6 +25,7 @@ from arclib.representers import (
     TextTaskRepresenter,
     TextExampleRepresenter,
     WordGridRepresenter,
+    build_text_grid_representer,
 )
 from arclib.messagers import GPTTextMessageRepresenterForBarc, GPTTextMessageRepresenterV2
 from arclib.update_model import TTT
@@ -404,7 +405,7 @@ def main():
             input_header="",
             output_header="",
             output_footer="#",
-            grid_representer=PythonListGridRepresenter(),
+            grid_representer=build_text_grid_representer(),
         )
     )
 

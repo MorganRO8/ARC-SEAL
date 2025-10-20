@@ -75,6 +75,28 @@ class PromptDumpTests(unittest.TestCase):
         self.assertIn("utility functions", result.prompt_text.lower())
         self.assertIsNotNone(result.helper_library)
 
+    def test_prompt_omits_spatial_views_by_default(self) -> None:
+        task = _build_dummy_task()
+        tokenizer = _DummyTokenizer()
+
+        result = build_code_mode_prompt_for_task(task, tokenizer)
+
+        self.assertNotIn("Rotated 90° clockwise view:", result.prompt_text)
+        self.assertIn("Input 1:\n1 0", result.prompt_text)
+        self.assertIn("Output:\n0 1", result.prompt_text)
+
+    def test_prompt_includes_spatial_views_when_requested(self) -> None:
+        task = _build_dummy_task()
+        tokenizer = _DummyTokenizer()
+
+        result = build_code_mode_prompt_for_task(
+            task, tokenizer, include_spatial_grid_views=True
+        )
+
+        self.assertIn("Rotated 90° clockwise view:", result.prompt_text)
+        self.assertIn("Top-right to bottom-left diagonals:", result.prompt_text)
+        self.assertIn("Top-left to bottom-right diagonals:", result.prompt_text)
+
 
 if __name__ == "__main__":
     unittest.main()

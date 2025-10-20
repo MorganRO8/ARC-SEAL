@@ -7,7 +7,7 @@ import textwrap
 from collections import Counter
 from copy import deepcopy
 from datetime import datetime
-from typing import Any, Dict, List, Optional, Sequence, Tuple
+from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 import torch
@@ -25,7 +25,6 @@ from arclib.arc import (
     to_tuple,
 )
 from arclib.representers import (
-    CompositeRepresenter,
     ConnectedComponentRepresenter,
     DelimitedGridRepresenter,
     DiffExampleRepresenter,
@@ -36,6 +35,7 @@ from arclib.representers import (
     TextTaskRepresenter,
     TextExampleRepresenter,
     WordGridRepresenter,
+    build_text_grid_representer,
 )
 from arclib.messagers import (
     GPTTextMessageRepresenterForBarc,
@@ -43,6 +43,7 @@ from arclib.messagers import (
     PythonSolverMessageRepresenter,
 )
 from arclib.update_model import TTT
+from arclib.phase_io import PhaseJSONEncoder, load_phase1_results, save_phase1_results
 from inference.preprocess import get_preprocessed_tasks_single
 
 from arclib.voting import vote
@@ -137,20 +138,6 @@ def read_tasks_from_file(task_file: str, test: bool = False) -> List[Task]:
     with open(task_file, "r", encoding="utf-8") as handle:
         data = json.load(handle)
     return Task.read_tasks_from_dict(data, test=test)
-
-
-class NumpyEncoder(json.JSONEncoder):
-    """Custom JSON encoder to handle NumPy types."""
-    def default(self, obj):
-        if isinstance(obj, np.integer):
-            return int(obj)
-        if isinstance(obj, np.floating):
-            return float(obj)
-        if isinstance(obj, np.ndarray):
-            return obj.tolist()
-        if isinstance(obj, np.bool_):
-            return bool(obj)
-        return super(NumpyEncoder, self).default(obj)
 
 
 def _pad_or_crop_to_shape(
@@ -923,6 +910,9 @@ def main(
     vllm_enforce_eager: bool = True,
     vllm_tensor_parallel_size: int = 1,
     include_solver_helpers: bool = False,
+    include_spatial_grid_views: bool = False,
+    phase1_results_path: Optional[str] = None,
+    resume_phase2: bool = False,
 ):
     # lora config
     lora_config = LoraConfig(
@@ -950,7 +940,9 @@ def main(
                 input_header="",
                 output_header="",
                 output_footer="#",
-                grid_representer=PythonListGridRepresenter(),
+                grid_representer=build_text_grid_representer(
+                    include_spatial_grid_views
+                ),
             )
         )
 
@@ -1012,479 +1004,517 @@ def main(
     else:
         chat_template_kwargs = {}
 
-    # Phase 1: Generate configs using self-edit model
-    print("Phase 1: Generating configs using self-edit model...")
-    llm_kwargs = {}
-    if vllm_dtype:
-        llm_kwargs["dtype"] = vllm_dtype
-    if vllm_max_model_len and vllm_max_model_len > 0:
-        llm_kwargs["max_model_len"] = vllm_max_model_len
-    if vllm_max_num_batched_tokens and vllm_max_num_batched_tokens > 0:
-        llm_kwargs["max_num_batched_tokens"] = vllm_max_num_batched_tokens
-    if vllm_gpu_memory_utilization and vllm_gpu_memory_utilization > 0:
-        llm_kwargs["gpu_memory_utilization"] = vllm_gpu_memory_utilization
-    if vllm_tensor_parallel_size and vllm_tensor_parallel_size > 0:
-        llm_kwargs["tensor_parallel_size"] = vllm_tensor_parallel_size
-    llm_kwargs["enforce_eager"] = vllm_enforce_eager
-
-    print(f"Initializing vLLM with kwargs: {llm_kwargs}")
-    self_edit_model = LLM(model=model_name, **llm_kwargs)
-    sampling_params = SamplingParams(
-        max_tokens=128,
-        temperature=0.8,
+    default_phase1_results_path = os.path.join(
+        "loras/self-edit", experiment_name, "phase1_results.json"
     )
+    if phase1_results_path is None:
+        phase1_results_path = default_phase1_results_path
 
-    # Dictionary to store explored configs per task
-    explored_configs = {}
-    task_configs = {}  # Store full configs for each task
+    task_configs: Dict[str, Any]
 
-    total_tasks = min(n_tasks, len(tasks))
-    if n_tasks > len(tasks):
+    if resume_phase2:
+        if not os.path.exists(phase1_results_path):
+            raise FileNotFoundError(
+                f"Phase 1 results not found at {phase1_results_path}; cannot resume."
+            )
         print(
-            f"Requested {n_tasks} tasks but only {len(tasks)} available; limiting to {total_tasks}."
+            "Phase 1: Skipping generation and loading cached results from",
+            phase1_results_path,
+        )
+        persisted_payload = load_phase1_results(phase1_results_path)
+        task_configs = persisted_payload.get("task_configs", {})
+        if not isinstance(task_configs, dict):
+            raise ValueError(
+                "Persisted Phase 1 payload is malformed: 'task_configs' must be a dict."
+            )
+        if not task_configs:
+            print("Warning: Loaded Phase 1 results contain no task configurations.")
+        persisted_metadata = persisted_payload.get("metadata", {})
+        cached_code_mode = persisted_metadata.get("code_mode")
+        if cached_code_mode is not None and cached_code_mode != code_mode:
+            print(
+                "Warning: Cached Phase 1 results were produced with "
+                f"code_mode={cached_code_mode}, but current run uses code_mode={code_mode}."
+            )
+        cached_spatial = persisted_metadata.get("include_spatial_grid_views")
+        if (
+            cached_spatial is not None
+            and bool(cached_spatial) != bool(include_spatial_grid_views)
+        ):
+            print(
+                "Warning: Cached Phase 1 results were generated with "
+                f"include_spatial_grid_views={cached_spatial}, "
+                f"current flag={include_spatial_grid_views}."
+            )
+    else:
+        # Phase 1: Generate configs using self-edit model
+        print("Phase 1: Generating configs using self-edit model...")
+        llm_kwargs = {}
+        if vllm_dtype:
+            llm_kwargs["dtype"] = vllm_dtype
+        if vllm_max_model_len and vllm_max_model_len > 0:
+            llm_kwargs["max_model_len"] = vllm_max_model_len
+        if vllm_max_num_batched_tokens and vllm_max_num_batched_tokens > 0:
+            llm_kwargs["max_num_batched_tokens"] = vllm_max_num_batched_tokens
+        if vllm_gpu_memory_utilization and vllm_gpu_memory_utilization > 0:
+            llm_kwargs["gpu_memory_utilization"] = vllm_gpu_memory_utilization
+        if vllm_tensor_parallel_size and vllm_tensor_parallel_size > 0:
+            llm_kwargs["tensor_parallel_size"] = vllm_tensor_parallel_size
+        llm_kwargs["enforce_eager"] = vllm_enforce_eager
+
+        print(f"Initializing vLLM with kwargs: {llm_kwargs}")
+        self_edit_model = LLM(model=model_name, **llm_kwargs)
+        sampling_params = SamplingParams(
+            max_tokens=128,
+            temperature=0.8,
         )
 
-    progress_bar = tqdm(
-        total=total_tasks,
-        desc="Self-edit tasks",
-        unit="task",
-        position=2,
-        leave=True,
-        dynamic_ncols=True,
-    )
-    progress_bar.refresh()
-    try:
-        for i in range(total_tasks):
-            task = tasks[i]
+        # Dictionary to store explored configs per task
+        explored_configs = {}
+        task_configs = {}  # Store full configs for each task
 
-            # Get the base task name (without -0 or -1 suffix) skip if it has -1 suffix
-            base_task_name = task.name
-            if base_task_name.endswith("-0"):
-                base_task_name = base_task_name[:-2]
-            if base_task_name.endswith("-1"):
-                progress_bar.update(1)
-                continue
+        total_tasks = min(n_tasks, len(tasks))
+        if n_tasks > len(tasks):
+            print(
+                f"Requested {n_tasks} tasks but only {len(tasks)} available; limiting to {total_tasks}."
+            )
 
-            context_budget: Optional[int] = None
-            max_model_len: Optional[int] = None
-            size_hint: Optional[Tuple[int, int]] = None
-            size_metadata: Optional[Dict[str, Any]] = None
-            base_prompt_messages: Optional[List[Dict[str, Any]]] = None
+        progress_bar = tqdm(
+            total=total_tasks,
+            desc="Self-edit tasks",
+            unit="task",
+            position=2,
+            leave=True,
+            dynamic_ncols=True,
+        )
+        progress_bar.refresh()
+        try:
+            for i in range(total_tasks):
+                task = tasks[i]
 
-            if code_mode:
-                size_hint, size_metadata = infer_output_shape(task)
-                if size_hint is not None:
-                    print(
-                        "Inferred output size for",
-                        f"{base_task_name}: {size_hint[0]}×{size_hint[1]}",
-                        f"(method={size_metadata.get('method') if size_metadata else 'unknown'})",
-                    )
-                encoded_messages, _ = representer.encode(
-                    task,
-                    size_inference=(size_hint, size_metadata),
-                    execution_limits=execution_limits_payload,
-                    helper_summary=helper_prompt_summary,
-                    helper_groups=helper_prompt_groups,
-                    helper_namespace=helper_namespace,
-                )
-                base_prompt_messages = [deepcopy(message) for message in encoded_messages]
-
-                def _prepare_prompt(messages: List[Dict[str, Any]]) -> Tuple[str, int]:
-                    prompt_text_local = tokenizer.apply_chat_template(
-                        messages,
-                        tokenize=False,
-                        add_generation_prompt=True,
-                        **chat_template_kwargs,
-                    )
-                    prompt_tokens = tokenizer(
-                        prompt_text_local,
-                        return_tensors="pt",
-                        add_special_tokens=False,
-                    )
-                    prompt_length = int(prompt_tokens["input_ids"].shape[-1])
-                    return prompt_text_local, prompt_length
-
-                try:
-                    base_prompt_text, initial_prompt_length = _prepare_prompt(base_prompt_messages)
-                except ValueError as error:
-                    print(
-                        "Failed to tokenize prompt for task"
-                        f" {base_task_name}: {error}"
-                    )
+                # Get the base task name (without -0 or -1 suffix) skip if it has -1 suffix
+                base_task_name = task.name
+                if base_task_name.endswith("-0"):
+                    base_task_name = base_task_name[:-2]
+                if base_task_name.endswith("-1"):
                     progress_bar.update(1)
                     continue
 
-                if vllm_max_model_len and vllm_max_model_len > 0:
-                    max_model_len = vllm_max_model_len
-                else:
-                    max_model_len = getattr(
-                        getattr(self_edit_model, "llm_engine", None),
-                        "max_model_len",
-                        None,
+                context_budget: Optional[int] = None
+                max_model_len: Optional[int] = None
+                size_hint: Optional[Tuple[int, int]] = None
+                size_metadata: Optional[Dict[str, Any]] = None
+                base_prompt_messages: Optional[List[Dict[str, Any]]] = None
+                run_code_mode_attempt: Optional[
+                    Callable[[], Tuple[Optional[Dict[str, Any]], bool, bool]]
+                ] = None
+
+                if code_mode:
+                    size_hint, size_metadata = infer_output_shape(task)
+                    if size_hint is not None:
+                        print(
+                            "Inferred output size for",
+                            f"{base_task_name}: {size_hint[0]}×{size_hint[1]}",
+                            f"(method={size_metadata.get('method') if size_metadata else 'unknown'})",
+                        )
+                    encoded_messages, _ = representer.encode(
+                        task,
+                        size_inference=(size_hint, size_metadata),
+                        execution_limits=execution_limits_payload,
+                        helper_summary=helper_prompt_summary,
+                        helper_groups=helper_prompt_groups,
+                        helper_namespace=helper_namespace,
                     )
-                    if max_model_len is None and getattr(
-                        getattr(self_edit_model, "llm_engine", None),
-                        "model_config",
-                        None,
-                    ) is not None:
+                    base_prompt_messages = [deepcopy(message) for message in encoded_messages]
+
+                    def _prepare_prompt(messages: List[Dict[str, Any]]) -> Tuple[str, int]:
+                        prompt_text_local = tokenizer.apply_chat_template(
+                            messages,
+                            tokenize=False,
+                            add_generation_prompt=True,
+                            **chat_template_kwargs,
+                        )
+                        prompt_tokens = tokenizer(
+                            prompt_text_local,
+                            return_tensors="pt",
+                            add_special_tokens=False,
+                        )
+                        prompt_length = int(prompt_tokens["input_ids"].shape[-1])
+                        return prompt_text_local, prompt_length
+
+                    try:
+                        base_prompt_text, initial_prompt_length = _prepare_prompt(base_prompt_messages)
+                    except ValueError as error:
+                        print(
+                            "Failed to tokenize prompt for task"
+                            f" {base_task_name}: {error}"
+                        )
+                        progress_bar.update(1)
+                        continue
+
+                    if vllm_max_model_len and vllm_max_model_len > 0:
+                        max_model_len = vllm_max_model_len
+                    else:
                         max_model_len = getattr(
-                            self_edit_model.llm_engine.model_config,
+                            getattr(self_edit_model, "llm_engine", None),
                             "max_model_len",
                             None,
                         )
-
-                if max_model_len is not None:
-                    context_budget = max_model_len - (sampling_params.max_tokens or 0)
-                    if context_budget <= 0:
-                        print(
-                            "No room for prompt tokens with current generation "
-                            f"budget (max_model_len={max_model_len}, "
-                            f"max_tokens={sampling_params.max_tokens})."
-                        )
-                        progress_bar.update(1)
-                        continue
-
-                    if initial_prompt_length > context_budget:
-                        print(
-                            f"Skipping task {base_task_name}: prompt requires "
-                            f"{initial_prompt_length} tokens but only "
-                            f"{context_budget} are available."
-                        )
-                        progress_bar.update(1)
-                        continue
-
-                def _run_code_mode_attempt() -> Tuple[Optional[Dict[str, Any]], bool, bool]:
-                    """Run a single code-mode attempt with feedback-driven retries.
-
-                    Returns ``(attempt_entry, skipped, abort_task)`` where ``attempt_entry``
-                    is populated when a program was executed, ``skipped`` is ``True`` when the
-                    generation was discarded (e.g., duplicate program), and ``abort_task`` is
-                    ``True`` when the task should stop generating further attempts entirely.
-                    """
-
-                    if base_prompt_messages is None:
-                        return None, False, True
-
-                    conversation_messages = [
-                        deepcopy(message) for message in base_prompt_messages
-                    ]
-                    retries_remaining = retry_budget
-                    attempt_retry_history: List[Dict[str, Any]] = []
-
-                    local_reward: float = 0.0
-                    local_success = False
-                    local_correct_cells: Optional[int] = None
-                    local_total_cells: Optional[int] = None
-                    local_reward_reason: Optional[str] = None
-                    local_predicted_output = None
-                    local_normalized_output = None
-                    local_rejection_reason: Optional[str] = None
-                    local_execution_payload: Dict[str, Any] = {}
-                    local_formatting_result: Optional[FormattingResult] = None
-                    local_exec_result: Optional[SolverResult] = None
-                    local_final_code: Optional[str] = None
-                    local_raw_code: Optional[str] = None
-                    local_raw_response: str = ""
-                    local_token_ids = None
-
-                    abort_task = False
-                    skip_attempt = False
-
-                    while True:
-                        try:
-                            prompt_text_current, prompt_token_length = _prepare_prompt(
-                                conversation_messages
+                        if max_model_len is None and getattr(
+                            getattr(self_edit_model, "llm_engine", None),
+                            "model_config",
+                            None,
+                        ) is not None:
+                            max_model_len = getattr(
+                                self_edit_model.llm_engine.model_config,
+                                "max_model_len",
+                                None,
                             )
-                        except ValueError as error:
+
+                    if max_model_len is not None:
+                        context_budget = max_model_len - (sampling_params.max_tokens or 0)
+                        if context_budget <= 0:
                             print(
-                                "Failed to tokenize prompt for task",
-                                f" {base_task_name}: {error}",
+                                "No room for prompt tokens with current generation "
+                                f"budget (max_model_len={max_model_len}, "
+                                f"max_tokens={sampling_params.max_tokens})."
                             )
-                            abort_task = True
-                            break
+                            progress_bar.update(1)
+                            continue
 
-                        if (
-                            context_budget is not None
-                            and prompt_token_length > context_budget
-                        ):
+                        if initial_prompt_length > context_budget:
                             print(
                                 f"Skipping task {base_task_name}: prompt requires "
-                                f"{prompt_token_length} tokens but only "
+                                f"{initial_prompt_length} tokens but only "
                                 f"{context_budget} are available."
                             )
-                            abort_task = True
-                            break
+                            progress_bar.update(1)
+                            continue
 
-                        try:
-                            response = self_edit_model.generate(
-                                prompt_text_current, sampling_params=sampling_params
-                            )
-                        except ValueError as error:
-                            if "maximum model length" in str(error).lower():
-                                print(
-                                    f"Skipping task {base_task_name} due to context "
-                                    f"overflow: {error}"
-                                )
-                                abort_task = True
-                                break
-                            raise
+                    def _run_code_mode_attempt() -> Tuple[Optional[Dict[str, Any]], bool, bool]:
+                        """Run a single code-mode attempt with feedback-driven retries.
 
-                        output = response[0].outputs[0]
-                        local_token_ids = output.token_ids
-                        raw_response = output.text or ""
-                        local_raw_response = raw_response
-                        code = extract_solver_code(raw_response)
-                        local_raw_code = code
+                        Returns ``(attempt_entry, skipped, abort_task)`` where ``attempt_entry``
+                        is populated when a program was executed, ``skipped`` is ``True`` when the
+                        generation was discarded (e.g., duplicate program), and ``abort_task`` is
+                        ``True`` when the task should stop generating further attempts entirely.
+                        """
 
-                        if (
-                            skip_repeated_configs
-                            and code
-                            and code in explored_configs[base_task_name]
-                        ):
-                            print(
-                                f"Skipping already explored program for task {base_task_name}"
-                            )
-                            skip_attempt = True
-                            break
+                        if base_prompt_messages is None:
+                            return None, False, True
 
-                        if code:
-                            explored_configs[base_task_name].add(code)
+                        conversation_messages = [
+                            deepcopy(message) for message in base_prompt_messages
+                        ]
+                        retries_remaining = retry_budget
+                        attempt_retry_history: List[Dict[str, Any]] = []
 
-                        assistant_content = code if code else raw_response
-                        conversation_messages.append(
-                            {"role": "assistant", "content": assistant_content}
-                        )
-
-                        execution_payload: Dict[str, Any] = {
-                            "success": False,
-                            "error_type": None,
-                            "message": None,
-                            "stdout": "",
-                            "stderr": "",
-                            "exit_code": None,
-                            "timeout_s": solver_timeout,
-                            "cpu_time_limit_s": solver_cpu_time_limit_s,
-                            "memory_limit_mb": solver_memory_limit_value,
-                        }
-                        helper_info_payload: Dict[str, Any] = {
-                            "included": helper_library is not None,
-                            "helper_error": False,
-                            "helper_exception_type": None,
-                            "helper_function": None,
-                        }
-                        if helper_library is not None:
-                            helper_info_payload.update(
-                                {
-                                    "namespace": helper_library.namespace,
-                                    "source_sha256": helper_source_digest,
-                                }
-                            )
-                        execution_payload["solver_helpers"] = helper_info_payload
-                        execution_attempts: List[Dict[str, Any]] = []
-
-                        local_reward = 0.0
+                        local_reward: float = 0.0
                         local_success = False
-                        local_correct_cells = None
-                        local_total_cells = None
-                        local_reward_reason = None
-                        local_reward_details: Dict[str, Any] = {}
+                        local_correct_cells: Optional[int] = None
+                        local_total_cells: Optional[int] = None
+                        local_reward_reason: Optional[str] = None
                         local_predicted_output = None
                         local_normalized_output = None
-                        local_rejection_reason = None
-                        local_exec_result = None
-                        local_formatting_result = None
-                        local_final_code = code
+                        local_rejection_reason: Optional[str] = None
+                        local_execution_payload: Dict[str, Any] = {}
+                        local_formatting_result: Optional[FormattingResult] = None
+                        local_exec_result: Optional[SolverResult] = None
+                        local_final_code: Optional[str] = None
+                        local_raw_code: Optional[str] = None
+                        local_raw_response: str = ""
+                        local_token_ids = None
 
-                        if code:
-                            local_rejection_reason = detect_unbounded_control_flow(code)
-
-                        if code and local_rejection_reason is None:
-                            local_exec_result = run_solver(
-                                local_final_code or "",
-                                train_examples=task.train_examples,
-                                test_input=task.test_example.input,
-                                timeout=solver_timeout,
-                                memory_limit_mb=solver_memory_limit_value,
-                                cpu_time_limit_s=solver_cpu_time_limit_s,
-                                helper_library=helper_library,
+                        while True:
+                            try:
+                                prompt_text_current, prompt_token_length = _prepare_prompt(
+                                    conversation_messages
+                                )
+                            except ValueError as error:
+                                print(
+                                    "Failed to tokenize prompt for task",
+                                    f" {base_task_name}: {error}",
+                                )
+                                return None, False, True
+    
+                            if (
+                                context_budget is not None
+                                and prompt_token_length > context_budget
+                            ):
+                                print(
+                                    f"Skipping task {base_task_name}: prompt requires "
+                                    f"{prompt_token_length} tokens but only "
+                                    f"{context_budget} are available."
+                                )
+                                return None, False, True
+    
+                            try:
+                                response = self_edit_model.generate(
+                                    prompt_text_current, sampling_params=sampling_params
+                                )
+                            except ValueError as error:
+                                if "maximum model length" in str(error).lower():
+                                    print(
+                                        f"Skipping task {base_task_name} due to context "
+                                        f"overflow: {error}"
+                                    )
+                                    return None, False, True
+                                raise
+    
+                            output = response[0].outputs[0]
+                            local_token_ids = output.token_ids
+                            raw_response = output.text or ""
+                            local_raw_response = raw_response
+                            code = extract_solver_code(raw_response)
+                            local_raw_code = code
+    
+                            if (
+                                skip_repeated_configs
+                                and code
+                                and code in explored_configs[base_task_name]
+                            ):
+                                print(
+                                    f"Skipping already explored program for task {base_task_name}"
+                                )
+                                return None, True, False
+    
+                            if code:
+                                explored_configs[base_task_name].add(code)
+    
+                            assistant_content = code if code else raw_response
+                            conversation_messages.append(
+                                {"role": "assistant", "content": assistant_content}
                             )
-                            execution_attempts.append(
-                                {
-                                    "origin": "model",
-                                    "code": local_final_code,
-                                    "result": _serialize_solver_result(local_exec_result),
-                                }
-                            )
-                            if local_exec_result.exit_code is not None:
-                                execution_payload["exit_code"] = local_exec_result.exit_code
+    
+                            execution_payload: Dict[str, Any] = {
+                                "success": False,
+                                "error_type": None,
+                                "message": None,
+                                "stdout": "",
+                                "stderr": "",
+                                "exit_code": None,
+                                "timeout_s": solver_timeout,
+                                "cpu_time_limit_s": solver_cpu_time_limit_s,
+                                "memory_limit_mb": solver_memory_limit_value,
+                            }
+                            helper_info_payload: Dict[str, Any] = {
+                                "included": helper_library is not None,
+                                "helper_error": False,
+                                "helper_exception_type": None,
+                                "helper_function": None,
+                            }
                             if helper_library is not None:
                                 helper_info_payload.update(
                                     {
-                                        "helper_error": bool(local_exec_result.helper_error),
-                                        "helper_exception_type": local_exec_result.helper_exception_type,
-                                        "helper_function": local_exec_result.helper_function,
+                                        "namespace": helper_library.namespace,
+                                        "source_sha256": helper_source_digest,
                                     }
                                 )
-
-                            if _needs_indentation_fix(local_exec_result):
-                                local_formatting_result = try_fix_indentation(
-                                    local_final_code or ""
+                            execution_payload["solver_helpers"] = helper_info_payload
+                            execution_attempts: List[Dict[str, Any]] = []
+    
+                            local_reward = 0.0
+                            local_success = False
+                            local_correct_cells = None
+                            local_total_cells = None
+                            local_reward_reason = None
+                            local_reward_details: Dict[str, Any] = {}
+                            local_predicted_output = None
+                            local_normalized_output = None
+                            local_rejection_reason = None
+                            local_exec_result = None
+                            local_formatting_result = None
+                            local_final_code = code
+    
+                            if code:
+                                local_rejection_reason = detect_unbounded_control_flow(code)
+    
+                            if code and local_rejection_reason is None:
+                                local_exec_result = run_solver(
+                                    local_final_code or "",
+                                    train_examples=task.train_examples,
+                                    test_input=task.test_example.input,
+                                    timeout=solver_timeout,
+                                    memory_limit_mb=solver_memory_limit_value,
+                                    cpu_time_limit_s=solver_cpu_time_limit_s,
+                                    helper_library=helper_library,
                                 )
-                                formatted_code = local_formatting_result.formatted_code
-                                if (
-                                    formatted_code
-                                    and formatted_code != local_final_code
-                                ):
-                                    local_final_code = formatted_code
-                                    local_exec_result = run_solver(
-                                        local_final_code,
-                                        train_examples=task.train_examples,
-                                        test_input=task.test_example.input,
-                                        timeout=solver_timeout,
-                                        memory_limit_mb=solver_memory_limit_value,
-                                        cpu_time_limit_s=solver_cpu_time_limit_s,
-                                        helper_library=helper_library,
-                                    )
-                                    execution_attempts.append(
+                                execution_attempts.append(
+                                    {
+                                        "origin": "model",
+                                        "code": local_final_code,
+                                        "result": _serialize_solver_result(local_exec_result),
+                                    }
+                                )
+                                if local_exec_result.exit_code is not None:
+                                    execution_payload["exit_code"] = local_exec_result.exit_code
+                                if helper_library is not None:
+                                    helper_info_payload.update(
                                         {
-                                            "origin": "autoformatted",
-                                            "code": local_final_code,
-                                            "result": _serialize_solver_result(
-                                                local_exec_result
-                                            ),
+                                            "helper_error": bool(local_exec_result.helper_error),
+                                            "helper_exception_type": local_exec_result.helper_exception_type,
+                                            "helper_function": local_exec_result.helper_function,
                                         }
                                     )
-                                    if local_exec_result.exit_code is not None:
-                                        execution_payload["exit_code"] = (
-                                            local_exec_result.exit_code
+    
+                                if _needs_indentation_fix(local_exec_result):
+                                    local_formatting_result = try_fix_indentation(
+                                        local_final_code or ""
+                                    )
+                                    formatted_code = local_formatting_result.formatted_code
+                                    if (
+                                        formatted_code
+                                        and formatted_code != local_final_code
+                                    ):
+                                        local_final_code = formatted_code
+                                        local_exec_result = run_solver(
+                                            local_final_code,
+                                            train_examples=task.train_examples,
+                                            test_input=task.test_example.input,
+                                            timeout=solver_timeout,
+                                            memory_limit_mb=solver_memory_limit_value,
+                                            cpu_time_limit_s=solver_cpu_time_limit_s,
+                                            helper_library=helper_library,
                                         )
-                                    if helper_library is not None:
-                                        helper_info_payload.update(
+                                        execution_attempts.append(
                                             {
-                                                "helper_error": bool(local_exec_result.helper_error),
-                                                "helper_exception_type": local_exec_result.helper_exception_type,
-                                                "helper_function": local_exec_result.helper_function,
+                                                "origin": "autoformatted",
+                                                "code": local_final_code,
+                                                "result": _serialize_solver_result(
+                                                    local_exec_result
+                                                ),
                                             }
                                         )
-                        elif code and local_rejection_reason is not None:
-                            local_reward_reason = "rejected_unbounded_loop"
-                            execution_payload.update(
-                                {
-                                    "error_type": "RejectedPattern",
-                                    "message": (
-                                        "Skipped execution because the program contains "
-                                        f"{local_rejection_reason}."
-                                    ),
-                                    "rejection_reason": local_rejection_reason,
-                                }
-                            )
-                        else:
-                            execution_payload.update(
-                                {
-                                    "error_type": "CodeExtractionError",
-                                    "message": "No executable code block found in response.",
-                                }
-                            )
-
-                        if local_exec_result is not None:
-                            payload_dict = _serialize_solver_result(local_exec_result)
-                            execution_payload.update(payload_dict)
-
-                            if local_exec_result.output is not None:
-                                predicted_array = local_exec_result.output
-                                local_predicted_output = (
-                                    predicted_array.tolist()
-                                    if isinstance(predicted_array, np.ndarray)
-                                    else predicted_array
+                                        if local_exec_result.exit_code is not None:
+                                            execution_payload["exit_code"] = (
+                                                local_exec_result.exit_code
+                                            )
+                                        if helper_library is not None:
+                                            helper_info_payload.update(
+                                                {
+                                                    "helper_error": bool(local_exec_result.helper_error),
+                                                    "helper_exception_type": local_exec_result.helper_exception_type,
+                                                    "helper_function": local_exec_result.helper_function,
+                                                }
+                                            )
+                            elif code and local_rejection_reason is not None:
+                                local_reward_reason = "rejected_unbounded_loop"
+                                execution_payload.update(
+                                    {
+                                        "error_type": "RejectedPattern",
+                                        "message": (
+                                            "Skipped execution because the program contains "
+                                            f"{local_rejection_reason}."
+                                        ),
+                                        "rejection_reason": local_rejection_reason,
+                                    }
                                 )
-                                execution_payload["output"] = local_predicted_output
-
-                                (
-                                    local_reward,
-                                    local_correct_cells,
-                                    local_total_cells,
-                                    local_reward_reason,
-                                    normalized_array,
-                                    local_reward_details,
-                                ) = score_grid_prediction(
-                                    predicted_array,
-                                    expected_output,
-                                    shape_hint=size_hint,
-                                    reference_input=task.test_example.input,
+                            else:
+                                execution_payload.update(
+                                    {
+                                        "error_type": "CodeExtractionError",
+                                        "message": "No executable code block found in response.",
+                                    }
                                 )
-
-                                if normalized_array is not None:
-                                    if isinstance(normalized_array, np.ndarray):
-                                        local_normalized_output = normalized_array.tolist()
+    
+                            if local_exec_result is not None:
+                                payload_dict = _serialize_solver_result(local_exec_result)
+                                execution_payload.update(payload_dict)
+    
+                                if local_exec_result.output is not None:
+                                    predicted_array = local_exec_result.output
+                                    local_predicted_output = (
+                                        predicted_array.tolist()
+                                        if isinstance(predicted_array, np.ndarray)
+                                        else predicted_array
+                                    )
+                                    execution_payload["output"] = local_predicted_output
+    
+                                    (
+                                        local_reward,
+                                        local_correct_cells,
+                                        local_total_cells,
+                                        local_reward_reason,
+                                        normalized_array,
+                                        local_reward_details,
+                                    ) = score_grid_prediction(
+                                        predicted_array,
+                                        expected_output,
+                                        shape_hint=size_hint,
+                                        reference_input=task.test_example.input,
+                                    )
+    
+                                    if normalized_array is not None:
+                                        if isinstance(normalized_array, np.ndarray):
+                                            local_normalized_output = normalized_array.tolist()
+                                        else:
+                                            local_normalized_output = np.asarray(
+                                                normalized_array
+                                            ).tolist()
+    
+                                    if expected_output is None:
+                                        local_success = local_exec_result.success
                                     else:
-                                        local_normalized_output = np.asarray(
-                                            normalized_array
-                                        ).tolist()
-
-                                if expected_output is None:
-                                    local_success = local_exec_result.success
+                                        local_success = bool(
+                                            local_reward_details.get("exact_match", False)
+                                        )
                                 else:
-                                    local_success = bool(
-                                        local_reward_details.get("exact_match", False)
+                                    if local_exec_result.success and expected_output is None:
+                                        local_success = True
+                                    local_reward_reason = local_reward_reason or (
+                                        local_exec_result.error_type or "execution_failed"
                                     )
                             else:
-                                if local_exec_result.success and expected_output is None:
-                                    local_success = True
-                                local_reward_reason = local_reward_reason or (
-                                    local_exec_result.error_type or "execution_failed"
+                                local_reward = 0.0
+    
+                            if local_reward_reason is not None:
+                                execution_payload["grid_evaluation_reason"] = local_reward_reason
+                            if local_rejection_reason is not None:
+                                execution_payload["rejection_reason"] = local_rejection_reason
+                            if local_reward_details:
+                                execution_payload["grid_reward_details"] = dict(
+                                    local_reward_details
                                 )
-                        else:
-                            local_reward = 0.0
-
-                        if local_reward_reason is not None:
-                            execution_payload["grid_evaluation_reason"] = local_reward_reason
-                        if local_rejection_reason is not None:
-                            execution_payload["rejection_reason"] = local_rejection_reason
-                        if local_reward_details:
-                            execution_payload["grid_reward_details"] = dict(
-                                local_reward_details
-                            )
-
-                        local_execution_payload = execution_payload
-
-                        step_record: Dict[str, Any] = {
-                            "code": local_final_code,
-                            "raw_code": local_raw_code,
-                            "raw_response": local_raw_response,
-                            "execution": execution_payload.copy(),
-                            "executions": execution_attempts,
-                        }
-                        if local_formatting_result is not None:
-                            step_record["formatting"] = {
-                                "tool": local_formatting_result.tool,
-                                "changed": local_formatting_result.changed,
-                                "error": local_formatting_result.error,
+    
+                            local_execution_payload = execution_payload
+    
+                            step_record: Dict[str, Any] = {
+                                "code": local_final_code,
+                                "raw_code": local_raw_code,
+                                "raw_response": local_raw_response,
+                                "execution": execution_payload.copy(),
+                                "executions": execution_attempts,
                             }
+                            if local_formatting_result is not None:
+                                step_record["formatting"] = {
+                                    "tool": local_formatting_result.tool,
+                                    "changed": local_formatting_result.changed,
+                                    "error": local_formatting_result.error,
+                                }
+    
+                            attempt_retry_history.append(step_record)
+    
+                            if local_success or local_reward > 0.0 or retries_remaining <= 0:
+                                break
+    
+                            feedback_message = build_error_feedback(
+                                local_exec_result,
+                                reward_reason=local_reward_reason,
+                                formatting_result=local_formatting_result,
+                                retries_remaining=retries_remaining - 1,
+                            )
+                            step_record["feedback"] = feedback_message
+                            conversation_messages.append(
+                                {"role": "user", "content": feedback_message}
+                            )
+                            retries_remaining -= 1
+    
+                    if "attempt_retry_history" in locals():
+                        retry_history: List[Dict[str, Any]] = attempt_retry_history
+                    else:
+                        retry_history = []
 
-                        attempt_retry_history.append(step_record)
-
-                        if local_success or local_reward > 0.0 or retries_remaining <= 0:
-                            break
-
-                        feedback_message = build_error_feedback(
-                            local_exec_result,
-                            reward_reason=local_reward_reason,
-                            formatting_result=local_formatting_result,
-                            retries_remaining=retries_remaining - 1,
-                        )
-                        step_record["feedback"] = feedback_message
-                        conversation_messages.append(
-                            {"role": "user", "content": feedback_message}
-                        )
-                        retries_remaining -= 1
-
-                    if skip_attempt:
-                        return None, True, False
-
-                    if abort_task:
-                        return None, False, True
-
-                    if not attempt_retry_history:
+                    if not retry_history:
                         return None, False, True
 
                     prompt_messages_copy = [
@@ -1505,7 +1535,7 @@ def main(
                         "reward": float(local_reward),
                         "success": bool(local_success),
                         "chat_messages": chat_messages,
-                        "retry_history": attempt_retry_history,
+                        "retry_history": retry_history,
                     }
 
                     solver_helpers_entry = dict(execution_payload.get("solver_helpers", {}))
@@ -1615,7 +1645,9 @@ def main(
                     else:
                         attempt_entry["tokenized"] = None
 
-                    return attempt_entry, False, False
+                        return attempt_entry, False, False
+
+                run_code_mode_attempt = _run_code_mode_attempt
             else:
                 prompt_text = get_prompt(task, system_message, self_edit_prompt)
                 size_hint = None
@@ -1632,7 +1664,11 @@ def main(
 
             while len(task_configs[base_task_name]) < n_self_edits_per_task:
                 if code_mode:
-                    attempt_entry, skipped, abort_task = _run_code_mode_attempt()
+                    if run_code_mode_attempt is None:
+                        abort_task = True
+                        break
+                    abort_task = False
+                    attempt_entry, skipped, abort_task = run_code_mode_attempt()
                     if skipped:
                         continue
                     if attempt_entry is None:
@@ -1737,12 +1773,26 @@ def main(
                 print(f"New config for task {base_task_name}:", config)
 
             progress_bar.update(1)
-    finally:
-        progress_bar.close()
+        finally:
+            progress_bar.close()
 
-    # Delete self-edit model to free memory
-    del self_edit_model
-    print("Phase 1 complete.")
+        # Delete self-edit model to free memory
+        del self_edit_model
+        print("Phase 1 complete.")
+
+        metadata = {
+            "experiment_name": experiment_name,
+            "model_name": model_name,
+            "code_mode": code_mode,
+            "include_spatial_grid_views": include_spatial_grid_views,
+            "n_tasks": total_tasks,
+        }
+        save_phase1_results(
+            phase1_results_path,
+            task_configs,
+            metadata=metadata,
+        )
+        print("Phase 1 results saved to:", phase1_results_path)
 
     # Phase 2: Train models using generated configs
     print("\nPhase 2: Training models using generated configs...")
@@ -1899,7 +1949,7 @@ def main(
     configs_file = os.path.join(f"loras/self-edit/{experiment_name}", "final_configs_and_indices.json")
     os.makedirs(os.path.dirname(configs_file), exist_ok=True)
     with open(configs_file, "w") as f:
-        json.dump(final_configs_and_indices, f)
+        json.dump(final_configs_and_indices, f, cls=PhaseJSONEncoder)
     
     print("Training complete. Final configs and indices saved to:", configs_file)
     
@@ -1949,6 +1999,12 @@ if __name__ == "__main__":
                       help='Disable eager enforcement if you prefer torch.compile graphs.')
     parser.add_argument('--include_solver_helpers', action='store_true',
                       help='Expose the curated ARC solver helper library to code-mode runs and describe it in prompts.')
+    parser.add_argument('--include_spatial_grid_views', action='store_true',
+                      help='Augment textual prompts with rotated and diagonal grid views.')
+    parser.add_argument('--phase1_results_path', type=str, default=None,
+                      help='Optional path to persist Phase 1 outputs (defaults to loras/self-edit/<experiment>/phase1_results.json).')
+    parser.add_argument('--resume_phase2', action='store_true',
+                      help='Skip Phase 1 generation and resume Phase 2 using cached Phase 1 outputs.')
     parser.set_defaults(vllm_enforce_eager=True)
 
     args = parser.parse_args()
@@ -1978,6 +2034,9 @@ if __name__ == "__main__":
         vllm_enforce_eager=args.vllm_enforce_eager,
         vllm_tensor_parallel_size=args.vllm_tensor_parallel_size,
         include_solver_helpers=args.include_solver_helpers,
+        include_spatial_grid_views=args.include_spatial_grid_views,
+        phase1_results_path=args.phase1_results_path,
+        resume_phase2=args.resume_phase2,
     )
     
    

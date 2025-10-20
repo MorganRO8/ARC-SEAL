@@ -18,6 +18,11 @@ from transformers import AutoTokenizer
 
 from arclib.arc import Task, read_tasks_from_single_file
 from arclib.messagers import PythonSolverMessageRepresenter
+from arclib.representers import (
+    TextExampleRepresenter,
+    TextTaskRepresenter,
+    build_text_grid_representer,
+)
 from utils.chat_template import detect_thinking_support
 from utils.output_size_inference import infer_output_shape
 from utils.solver_helpers import HelperLibrary, get_helper_library
@@ -55,6 +60,7 @@ def build_code_mode_prompt_for_task(
     tokenizer,
     *,
     include_helpers: bool = False,
+    include_spatial_grid_views: bool = False,
     execution_limits: Optional[Dict[str, Any]] = None,
     chat_template_kwargs: Optional[Dict[str, Any]] = None,
 ) -> PromptRenderResult:
@@ -65,7 +71,18 @@ def build_code_mode_prompt_for_task(
     if chat_template_kwargs is None:
         chat_template_kwargs = {}
 
-    representer = PythonSolverMessageRepresenter()
+    grid_representer = build_text_grid_representer(
+        include_spatial_views=include_spatial_grid_views
+    )
+    task_representer = TextTaskRepresenter(
+        example_representer=TextExampleRepresenter(
+            io_sep="",
+            input_header="",
+            output_header="",
+            grid_representer=grid_representer,
+        )
+    )
+    representer = PythonSolverMessageRepresenter(task_representer=task_representer)
 
     helper_library: Optional[HelperLibrary] = None
     helper_kwargs: Dict[str, Any] = {}
@@ -189,6 +206,14 @@ def parse_args() -> argparse.Namespace:
         help="Include the optional solver helper library in the prompt and sandbox scope.",
     )
     parser.add_argument(
+        "--include_spatial_grid_views",
+        action="store_true",
+        help=(
+            "Augment the default grid text with rotated and diagonal views to provide"
+            " richer spatial context."
+        ),
+    )
+    parser.add_argument(
         "--solver_timeout",
         type=float,
         default=5.0,
@@ -278,6 +303,7 @@ def main() -> None:
         selected_task,
         tokenizer,
         include_helpers=args.include_solver_helpers,
+        include_spatial_grid_views=args.include_spatial_grid_views,
         execution_limits=execution_limits,
         chat_template_kwargs=chat_template_kwargs,
     )

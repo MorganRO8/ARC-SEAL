@@ -8,6 +8,7 @@ import numpy as np
 import torch
 import datetime
 import uuid
+import math
 
 from peft import LoraConfig, get_peft_model, TaskType, PeftModel
 from torch.nn.utils.rnn import pad_sequence
@@ -263,39 +264,85 @@ class TTT:
         Returns:
             Trained model and tokenizer
         """
-        print(f"Training on {training_data['input_ids'].shape[0]} examples for {num_train_epochs} epochs, lr: {learning_rate}")
-        # Prepare dataset
-        ds = Dataset.from_dict(training_data)
-        
-
-        # Configure training arguments
-        training_args = TrainingArguments(
-            output_dir=output_dir,
-            per_device_train_batch_size=batch_size,
-            gradient_accumulation_steps=gradient_accumulation_steps,
-            learning_rate=learning_rate,
-            num_train_epochs=num_train_epochs,
-            lr_scheduler_type=lr_scheduler_type,
-            logging_steps=1,
-            save_strategy="no",
-            report_to="none",
-            bf16=True,  # Use bfloat16 precision
-            remove_unused_columns=False,
-            optim="adamw_torch",
-            warmup_steps=11,
-          )
-        
-        # Initialize trainer
-        trainer = Trainer(
-            model=self.model,
-            args=training_args,
-            train_dataset=ds,
-            
+        num_examples = int(training_data["input_ids"].shape[0])
+        print(
+            f"Training on {num_examples} examples for {num_train_epochs} epochs, lr: {learning_rate}"
         )
-        
-        # Train the model
-        print("Starting training...")
-        trainer.train()
-        print("Training complete.")
-        
+        ds = Dataset.from_dict(training_data)
+
+        if hasattr(self.model, "gradient_checkpointing_enable"):
+            self.model.gradient_checkpointing_enable()
+        if hasattr(self.model, "enable_input_require_grads"):
+            self.model.enable_input_require_grads()
+        if getattr(self.model, "config", None) is not None:
+            try:
+                self.model.config.use_cache = False
+            except AttributeError:
+                pass
+
+        target_batch_size = max(int(batch_size), 1)
+        dataset_limited_batch = max(1, min(target_batch_size, num_examples))
+        target_global_batch = max(1, target_batch_size * max(int(gradient_accumulation_steps), 1))
+        attempted_batch_size = dataset_limited_batch
+
+        def _is_cuda_oom(error: BaseException) -> bool:
+            if isinstance(error, torch.cuda.OutOfMemoryError):
+                return True
+            message = str(error).lower()
+            return "cuda out of memory" in message or "cuda error: out of memory" in message
+
+        last_error: Optional[BaseException] = None
+
+        while attempted_batch_size >= 1:
+            effective_grad_accum = max(1, math.ceil(target_global_batch / attempted_batch_size))
+            print(
+                "Starting training attempt with per_device_train_batch_size="
+                f"{attempted_batch_size}, gradient_accumulation_steps={effective_grad_accum}"
+            )
+
+            training_args = TrainingArguments(
+                output_dir=output_dir,
+                per_device_train_batch_size=attempted_batch_size,
+                gradient_accumulation_steps=effective_grad_accum,
+                learning_rate=learning_rate,
+                num_train_epochs=num_train_epochs,
+                lr_scheduler_type=lr_scheduler_type,
+                logging_steps=1,
+                save_strategy="no",
+                report_to="none",
+                bf16=True,
+                gradient_checkpointing=True,
+                remove_unused_columns=False,
+                optim="adamw_torch",
+                warmup_steps=11,
+            )
+
+            trainer = Trainer(
+                model=self.model,
+                args=training_args,
+                train_dataset=ds,
+            )
+
+            try:
+                print("Starting training...")
+                trainer.train()
+                print("Training complete.")
+                break
+            except Exception as error:  # noqa: BLE001
+                if _is_cuda_oom(error) and attempted_batch_size > 1:
+                    last_error = error
+                    attempted_batch_size = max(attempted_batch_size // 2, 1)
+                    print(
+                        "Encountered CUDA OOM; retrying with per_device_train_batch_size="
+                        f"{attempted_batch_size}."
+                    )
+                    if torch.cuda.is_available():
+                        torch.cuda.empty_cache()
+                    self.reset_lora()
+                    continue
+                raise
+        else:
+            if last_error is not None:
+                raise last_error
+
         return self.model, self.tokenizer

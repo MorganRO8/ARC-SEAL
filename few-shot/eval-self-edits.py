@@ -30,6 +30,7 @@ from arclib.representers import (
     TextExampleRepresenter,
     TextTaskRepresenter,
     WordGridRepresenter,
+    build_text_grid_representer,
 )
 from arclib.voting import vote
 from inference.engine import get_sampling_params, initialize_engine, process_requests
@@ -77,6 +78,11 @@ parser.add_argument("--max_tokens", type=int, default=8192, help="Max tokens")
 parser.add_argument("--temperature", type=float, default=0.0, help="Temperature for sampling")
 parser.add_argument(
     "--n_sample", type=int, default=1, help="Number of samples to generate per input"
+)
+parser.add_argument(
+    "--include_spatial_grid_views",
+    action="store_true",
+    help="Augment textual prompts with rotated and diagonal grid views.",
 )
 parser.add_argument(
     "--experiment_folder", type=str, default="experiments/tti/new/", help="submission folder"
@@ -219,7 +225,9 @@ elif args.new_format:
                 input_header="",
                 output_header="",
                 output_footer="#",
-                grid_representer=PythonListGridRepresenter(),
+                grid_representer=build_text_grid_representer(
+                    args.include_spatial_grid_views
+                ),
             )
         )
     )
