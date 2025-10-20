@@ -1662,6 +1662,7 @@ def main(
 
             while len(task_configs[base_task_name]) < n_self_edits_per_task:
                 if code_mode:
+                    abort_task = False
                     attempt_entry, skipped, abort_task = _run_code_mode_attempt()
                     if skipped:
                         continue
