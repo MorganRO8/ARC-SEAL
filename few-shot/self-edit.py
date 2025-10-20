@@ -1223,7 +1223,6 @@ def main(
                         local_token_ids = None
 
                         abort_task = False
-                        skip_attempt = False
 
                         while True:
                             try:
@@ -1279,8 +1278,7 @@ def main(
                                 print(
                                     f"Skipping already explored program for task {base_task_name}"
                                 )
-                                skip_attempt = True
-                                break
+                                return None, True, False
     
                             if code:
                                 explored_configs[base_task_name].add(code)
@@ -1513,9 +1511,6 @@ def main(
                             )
                             retries_remaining -= 1
     
-                    if skip_attempt:
-                        return None, True, False
-
                     if abort_task:
                         return None, False, True
 
