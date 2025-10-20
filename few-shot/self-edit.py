@@ -1197,8 +1197,6 @@ def main(
                         ``True`` when the task should stop generating further attempts entirely.
                         """
 
-                        abort_task = False
-
                         if base_prompt_messages is None:
                             return None, False, True
 
@@ -1234,8 +1232,7 @@ def main(
                                     "Failed to tokenize prompt for task",
                                     f" {base_task_name}: {error}",
                                 )
-                                abort_task = True
-                                break
+                                return None, False, True
     
                             if (
                                 context_budget is not None
@@ -1246,8 +1243,7 @@ def main(
                                     f"{prompt_token_length} tokens but only "
                                     f"{context_budget} are available."
                                 )
-                                abort_task = True
-                                break
+                                return None, False, True
     
                             try:
                                 response = self_edit_model.generate(
@@ -1259,8 +1255,7 @@ def main(
                                         f"Skipping task {base_task_name} due to context "
                                         f"overflow: {error}"
                                     )
-                                    abort_task = True
-                                    break
+                                    return None, False, True
                                 raise
     
                             output = response[0].outputs[0]
@@ -1511,9 +1506,6 @@ def main(
                             )
                             retries_remaining -= 1
     
-                    if abort_task:
-                        return None, False, True
-
                     if not attempt_retry_history:
                         return None, False, True
 
