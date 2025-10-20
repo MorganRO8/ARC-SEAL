@@ -7,7 +7,7 @@ import textwrap
 from collections import Counter
 from copy import deepcopy
 from datetime import datetime
-from typing import Any, Dict, List, Optional, Sequence, Tuple
+from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 import torch
@@ -1105,6 +1105,9 @@ def main(
                 size_hint: Optional[Tuple[int, int]] = None
                 size_metadata: Optional[Dict[str, Any]] = None
                 base_prompt_messages: Optional[List[Dict[str, Any]]] = None
+                run_code_mode_attempt: Optional[
+                    Callable[[], Tuple[Optional[Dict[str, Any]], bool, bool]]
+                ] = None
 
                 if code_mode:
                     size_hint, size_metadata = infer_output_shape(task)
@@ -1643,6 +1646,8 @@ def main(
                         attempt_entry["tokenized"] = None
 
                     return attempt_entry, False, False
+
+                    run_code_mode_attempt = _run_code_mode_attempt
             else:
                 prompt_text = get_prompt(task, system_message, self_edit_prompt)
                 size_hint = None
@@ -1659,8 +1664,11 @@ def main(
 
             while len(task_configs[base_task_name]) < n_self_edits_per_task:
                 if code_mode:
+                    if run_code_mode_attempt is None:
+                        abort_task = True
+                        break
                     abort_task = False
-                    attempt_entry, skipped, abort_task = _run_code_mode_attempt()
+                    attempt_entry, skipped, abort_task = run_code_mode_attempt()
                     if skipped:
                         continue
                     if attempt_entry is None:
@@ -1764,7 +1772,7 @@ def main(
                 )
                 print(f"New config for task {base_task_name}:", config)
 
-                progress_bar.update(1)
+            progress_bar.update(1)
         finally:
             progress_bar.close()
 
