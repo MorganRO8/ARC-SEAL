@@ -1506,7 +1506,12 @@ def main(
                             )
                             retries_remaining -= 1
     
-                    if not attempt_retry_history:
+                    if "attempt_retry_history" in locals():
+                        retry_history: List[Dict[str, Any]] = attempt_retry_history
+                    else:
+                        retry_history = []
+
+                    if not retry_history:
                         return None, False, True
 
                     prompt_messages_copy = [
@@ -1527,7 +1532,7 @@ def main(
                         "reward": float(local_reward),
                         "success": bool(local_success),
                         "chat_messages": chat_messages,
-                        "retry_history": attempt_retry_history,
+                        "retry_history": retry_history,
                     }
 
                     solver_helpers_entry = dict(execution_payload.get("solver_helpers", {}))
