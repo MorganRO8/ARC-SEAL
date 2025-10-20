@@ -1645,9 +1645,9 @@ def main(
                     else:
                         attempt_entry["tokenized"] = None
 
-                    return attempt_entry, False, False
+                        return attempt_entry, False, False
 
-                    run_code_mode_attempt = _run_code_mode_attempt
+                run_code_mode_attempt = _run_code_mode_attempt
             else:
                 prompt_text = get_prompt(task, system_message, self_edit_prompt)
                 size_hint = None

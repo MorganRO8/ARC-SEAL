@@ -1,7 +1,9 @@
+import ast
 import importlib.util
 import sys
 import unittest
 from pathlib import Path
+from typing import List
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -39,6 +41,43 @@ class FormatProgressDetailsTest(unittest.TestCase):
 
     def test_returns_empty_string_when_no_metrics(self) -> None:
         self.assertEqual(self_edit._format_progress_details({}), "")
+
+
+class CodeModeAttemptRegistrationTest(unittest.TestCase):
+    def test_run_code_mode_attempt_bound_outside_helper(self) -> None:
+        source_path = ROOT / "self-edit.py"
+        source = source_path.read_text()
+        tree = ast.parse(source, filename=str(source_path))
+
+        bound_outside_helper = False
+
+        def visit(node: ast.AST, parents: List[ast.AST]) -> None:
+            nonlocal bound_outside_helper
+
+            if isinstance(node, ast.Assign):
+                for target in node.targets:
+                    if (
+                        isinstance(target, ast.Name)
+                        and target.id == "run_code_mode_attempt"
+                        and isinstance(node.value, ast.Name)
+                        and node.value.id == "_run_code_mode_attempt"
+                    ):
+                        if not any(
+                            isinstance(parent, ast.FunctionDef)
+                            and parent.name == "_run_code_mode_attempt"
+                            for parent in parents
+                        ):
+                            bound_outside_helper = True
+
+            for child in ast.iter_child_nodes(node):
+                visit(child, parents + [node])
+
+        visit(tree, [])
+
+        self.assertTrue(
+            bound_outside_helper,
+            "run_code_mode_attempt should be bound outside _run_code_mode_attempt",
+        )
 
 
 if __name__ == "__main__":
